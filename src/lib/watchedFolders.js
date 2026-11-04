@@ -66,3 +66,57 @@ export function newFilesForRescan(files, existingBooks) {
 export function isSupportedBookFile(file) {
   return /\.(epub|pdf|cbz|cbr|m4b|mp3)$/i.test(file.name)
 }
+
+// ---- Native SAF (Storage Access Framework) folders (v0.7.2) --------
+// A SAF folder is picked once with the system folder picker and its
+// tree URI is kept (persistable URI permission), so unlike a WebView
+// <input> pick it CAN be re-listed on a later start with no re-pick.
+// These helpers are plugin-free: the caller supplies listDir, which
+// resolves a path (null = the folder root) to entries shaped
+// { name, type } (type 'directory'/'file') or { name, isDir } — the
+// scoped-storage plugin returns `type`, so both are accepted.
+// Listing covers the folder root plus ONE level of subfolders.
+// Deeper nesting is intentionally not walked: book folders are
+// usually flat or one level deep, and a full recursive walk over a
+// huge tree would stall startup scans.
+export async function listSafBookFiles(listDir) {
+  const found = []
+  const root = await listDir(null)
+  for (const entry of root || []) {
+    const isDir = entry.type === 'directory' || entry.isDir === true
+    if (isDir) {
+      let sub = []
+      try { sub = await listDir(entry.name) } catch { sub = [] }
+      for (const f of sub || []) {
+        const subIsDir = f.type === 'directory' || f.isDir === true
+        if (!subIsDir && isSupportedBookFile(f)) found.push({ name: f.name, path: `${entry.name}/${f.name}` })
+      }
+    } else if (isSupportedBookFile(entry)) {
+      found.push({ name: entry.name, path: entry.name })
+    }
+  }
+  return found
+}
+
+// A file-like object importFiles() can consume: it only needs
+// `.name` and `.arrayBuffer()`. The bytes are fetched lazily, one
+// file at a time, so a whole folder is never held in memory at once.
+export function lazySafFile(name, readBytes) {
+  return {
+    name,
+    async arrayBuffer() { return readBytes() },
+  }
+}
+
+// Chunked base64 -> ArrayBuffer (no giant atob() call that can blow
+// the stack on a multi-megabyte book file).
+export function base64ToArrayBuffer(b64) {
+  const chunk = 32768
+  const bytes = new Uint8Array(Math.floor((b64.length * 3) / 4))
+  let out = 0
+  for (let i = 0; i < b64.length; i += chunk) {
+    const bin = atob(b64.slice(i, i + chunk))
+    for (let j = 0; j < bin.length; j++) bytes[out++] = bin.charCodeAt(j)
+  }
+  return bytes.slice(0, out).buffer
+}

@@ -8,6 +8,7 @@
     "@capacitor/haptics": "^8.0.2",
     "@capacitor/share": "^8.0.3",
     "@capawesome/capacitor-volume": "^0.1.3",
+    "@daniele-rolli/capacitor-scoped-storage": "0.1.0",
     "capacitor-plugin-playlist": "^8.0.0",
     "jszip": "^3.10.1",
     "pdfjs-dist": "^4.2.67",
@@ -27,5 +28,5 @@
     "preview": "vite preview"
   },
   "type": "module",
-  "version": "0.7.1"
+  "version": "0.7.2"
 }

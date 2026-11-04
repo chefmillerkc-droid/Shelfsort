@@ -18,7 +18,8 @@ import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
 import { exportCatalogFile } from './lib/catalogExport.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
-import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile } from './lib/watchedFolders.js'
+import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile, listSafBookFiles, lazySafFile, base64ToArrayBuffer } from './lib/watchedFolders.js'
+import { ScopedStorage } from '@daniele-rolli/capacitor-scoped-storage'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
   uploadToR2, downloadFromR2, headR2Object, deleteFromR2, listR2Objects,
@@ -250,11 +251,12 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('shelfsort-auto-apply-high', autoApplyHigh ? 'on' : 'off') } catch { /* ignore */ }
   }, [autoApplyHigh])
-  // Watched library folders (v0.7.1) — NAME/PATH ONLY in localStorage.
-  // A WebView <input> pick cannot persist a folder handle across
-  // sessions, so a saved folder is never silently re-opened: on
-  // startup the app only PROMPTS, and a rescan re-opens the picker
-  // so the user grants access again. See src/lib/watchedFolders.js.
+  // Watched library folders. Two kinds: SAF folders (v0.7.2, saved
+  // tree URI + persistable permission — re-listed on startup with
+  // no re-pick) and legacy WebView folders (NAME ONLY in
+  // localStorage — a WebView <input> pick cannot persist a folder
+  // handle, so those still need re-picking on rescan).
+  // See src/lib/watchedFolders.js.
   const [watchedFolders, setWatchedFolders] = useState(() => {
     try { const v = JSON.parse(localStorage.getItem('shelfsort-watched-folders') || '[]'); return Array.isArray(v) ? v : [] } catch { return [] }
   })
@@ -287,6 +289,15 @@ export default function App() {
   const watchFolderRef = useRef(null)
   const folderPickModeRef = useRef('library')
   const watchPickModeRef = useRef('add')
+  // Native SAF folders (v0.7.2): a tree URI kept with a persistable
+  // permission, so it CAN be re-listed on a later start with no
+  // re-pick — unlike WebView picks, which are name-only. Legacy
+  // entries (no `saf` flag) still use the WebView picker path.
+  const safStartupDoneRef = useRef(false)
+  // Per-folder rescan for legacy (WebView) rows: the next 'rescan'
+  // folder pick matches ONLY this name instead of every saved name.
+  const legacyRescanTargetRef = useRef(null)
+  const isNative = (() => { try { return Capacitor.isNativePlatform() } catch { return false } })()
   // Concise summary of the last Find Fixes run's auto-applied fixes.
   const [autoFixedSummary, setAutoFixedSummary] = useState([])
   const [edits, setEdits] = useState({})
@@ -501,7 +512,12 @@ export default function App() {
     }
     if (mode === 'rescan') {
       const existing = await getAllBooksMeta()
-      const wanted = new Set(watchedFolders.map((w) => w.name.toLowerCase()))
+      // Per-folder rescan (legacy rows): match only the tapped folder.
+      const target = legacyRescanTargetRef.current
+      legacyRescanTargetRef.current = null
+      const wanted = target
+        ? new Set([target.toLowerCase()])
+        : new Set(watchedFolders.map((w) => w.name.toLowerCase()))
       let toImport = []
       const found = {}
       for (const [name, groupFiles] of namedGroups) {
@@ -538,6 +554,140 @@ export default function App() {
       setWatchStatus("No folder name came back with this pick, so nothing was saved as a watched folder — but the files above were imported.")
     }
   }
+
+  // ---- Native SAF watched folders (v0.7.2) --------------------------
+  // Primary Add-folder path on Android: the system folder picker
+  // (ACTION_OPEN_DOCUMENT_TREE). The user navigates to a folder and
+  // confirms it with one tap — no select-all, no long-press, no
+  // individual file selection. The plugin keeps a persistable URI
+  // permission for the tree, so the saved id (a tree URI, NOT a
+  // filesystem path) can be re-listed on later starts with no
+  // re-pick. On web, or if the plugin is unavailable, the WebView
+  // folder/file inputs below remain as fallback.
+  function safFolderRef(w) { return { id: w.id, name: w.name } }
+  async function safListEntries(w, path) {
+    const args = { folder: safFolderRef(w) }
+    if (path) args.path = path
+    const res = await ScopedStorage.readdir(args)
+    return res.entries || []
+  }
+  async function scanSafFolder(w) {
+    const found = await listSafBookFiles((path) => safListEntries(w, path))
+    return found
+  }
+  // Import one SAF folder's books, deduped against the library by
+  // fileName+format (the same rule as WebView rescan). Returns
+  // { found, imported } and updates ONLY this folder's row.
+  async function importSafFolder(w) {
+    const found = await scanSafFolder(w)
+    const existing = await getAllBooksMeta()
+    const toImport = newFilesForRescan(found.map((f) => ({ name: f.name })), existing)
+    const lazyByName = new Map()
+    for (const f of found) {
+      if (!toImport.some((t) => t.name === f.name)) continue
+      lazyByName.set(f.name, lazySafFile(f.name, async () => {
+        const res = await ScopedStorage.readFile({ folder: safFolderRef(w), path: f.path, encoding: 'base64' })
+        return base64ToArrayBuffer(res.data)
+      }))
+    }
+    // newFilesForRescan can return two entries with the same name
+    // (same file name in two subfolders); importFiles keys books by
+    // fileName, so keep only the first of each name here.
+    const seenNames = new Set()
+    const lazyFiles = []
+    for (const t of toImport) {
+      if (seenNames.has(t.name)) continue
+      seenNames.add(t.name)
+      lazyFiles.push(lazyByName.get(t.name))
+    }
+    if (lazyFiles.length) await importFiles(lazyFiles)
+    else await reload()
+    setWatchedFolders((prev) => prev.map((x) => (
+      x.saf && x.id === w.id
+        ? { ...x, lastCount: found.length, lastScannedAt: Date.now() } : x
+    )))
+    return { found: found.length, imported: lazyFiles.length }
+  }
+  async function addSafFolder() {
+    let picked
+    try {
+      picked = await ScopedStorage.pickFolder()
+    } catch (e) {
+      // User cancelled the picker: not an error, just nothing to do.
+      if (String(e && e.message || e).includes('cancel')) { setWatchStatus('Folder pick cancelled.'); return }
+      setWatchStatus(`Could not open the folder picker: ${e && e.message ? e.message : e}`)
+      return
+    }
+    const folder = picked && picked.folder
+    if (!folder || !folder.id) { setWatchStatus('The folder picker did not return a folder. Try again.'); return }
+    const name = folder.name || 'Picked folder'
+    const w = { name, id: folder.id, saf: true }
+    setWatchedFolders((prev) => {
+      const rest = prev.filter((x) => !(x.saf && x.id === folder.id))
+      return [...rest, { ...w, lastCount: undefined, lastScannedAt: Date.now() }]
+    })
+    try {
+      const { found, imported } = await importSafFolder(w)
+      setWatchStatus(`Folder "${name}" saved — ${found} book file(s) found, ${imported} new imported. It will be rescanned automatically on startup; no re-pick needed.`)
+    } catch (e) {
+      // The folder was picked and saved, but listing/reading failed
+      // (permission revoked between pick and scan, folder moved, …).
+      setWatchStatus(`Folder "${name}" was saved, but it could not be read right now (${e && e.message ? e.message : e}). Re-pick it from Settings if it was moved, or tap its Rescan button to try again.`)
+    }
+  }
+  async function rescanSafFolder(w) {
+    try {
+      const { found, imported } = await importSafFolder(w)
+      setWatchStatus(imported
+        ? `Rescan of "${w.name}" done — imported ${imported} new book(s) (${found} found).`
+        : `Rescan of "${w.name}" done — no new books (${found} found, everything already in the library).`)
+    } catch (e) {
+      setWatchStatus(`"${w.name}" could not be opened — its permission may have been revoked, or the folder was moved or deleted. Re-pick just that folder from Settings (Remove, then Add folder) to restore it. (${e && e.message ? e.message : e})`)
+    }
+  }
+  async function rescanAllSafFolders() {
+    const saf = watchedFolders.filter((w) => w.saf && w.id)
+    if (!saf.length) { setWatchStatus('No saved-folder-access folders to rescan. Older folders still need the folder picker — use their per-folder Rescan button.'); return }
+    const lines = []
+    for (const w of saf) {
+      try {
+        const { found, imported } = await importSafFolder(w)
+        lines.push(`"${w.name}": ${imported} new of ${found} found`)
+      } catch (e) {
+        lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
+      }
+    }
+    setWatchStatus(`Startup rescan done — ${lines.join('; ')}`)
+  }
+  // TRUE startup scan (SAF folders only): runs once per app start
+  // when the toggle is ON, with no tap and no re-pick. Legacy
+  // (WebView) folders are NOT scanned here — they still need the
+  // Library prompt's Rescan, because the app holds no permission
+  // for them. A revoked/moved folder is reported by name, never
+  // silently skipped and never a crash: the loop continues.
+  useEffect(() => {
+    if (safStartupDoneRef.current) return
+    safStartupDoneRef.current = true
+    if (!scanOnStartup || !isNative) return
+    const saf = watchedFolders.filter((w) => w.saf && w.id)
+    if (!saf.length) return
+    ;(async () => {
+      const lines = []
+      for (const w of saf) {
+        try {
+          const { found, imported } = await importSafFolder(w)
+          lines.push(`"${w.name}": ${imported} new of ${found} found`)
+        } catch {
+          lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
+        }
+      }
+      setWatchStatus(`Startup rescan done — ${lines.join('; ')}`)
+    })()
+    // Only the mount run: watchedFolders/scanOnStartup are read
+    // from localStorage on first render, and re-running on every
+    // list change would re-import on every Add/Remove.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // ---- Enrichment / Fix Review ---------------------------------------
   // Shared writer for one book's fixes. When `auto` is true, the fix
@@ -1237,12 +1387,24 @@ export default function App() {
 
   // Full 3D flip drag: the flip follows the finger. Dragging left
   // turns forward, right turns back; progress = |dx| / page width.
-  // On release, past ~25% width or a fast flick completes the flip
-  // (and the turn); otherwise it snaps back with no page change and
-  // no haptic. A tap (no drag) is handled by onReaderClick.
+  // On release, past ~12% width, or a flick (over ~40px at over
+  // ~0.25 px/ms), completes the flip (and the turn); only a tiny,
+  // slow drag snaps back with no page change and no haptic — the
+  // old ~25% / 0.5 px/ms bar made a normal relaxed swipe fail both
+  // tests, so the page turned halfway and snapped back and the user
+  // needed a second, harder swipe to turn one page (v0.7.2 fix).
+  // A tap (no drag) is handled by onReaderClick.
   const readerTouch = useRef(null)
   function onReaderTouchStart(e) {
     cancelFlipAnim()
+    // If a flip animation was in flight, cancelFlipAnim stops its
+    // frames but leaves the page stuck at a partial rotation — a
+    // tap during an animation would then freeze the page mid-flip
+    // with no animation left to finish it, and the next swipe
+    // would start from that frozen state. Clear the flip outright
+    // so the new gesture starts from the current page cleanly;
+    // the first >8px of movement re-creates the flip for the drag.
+    if (flipRef.current) setFlipState(null)
     const t = e.touches[0]
     // In-app back band: a touch STARTING 56-160px from the left
     // edge is an EXIT candidate, not a page turn. A touch starting
@@ -1306,8 +1468,8 @@ export default function App() {
     const dx = t.clientX - d.x
     const dt = Math.max(1, Date.now() - d.t)
     const w = pageAreaRef.current ? pageAreaRef.current.clientWidth : 300
-    const flick = Math.abs(dx) > 50 && (Math.abs(dx) / dt) > 0.5 // px/ms
-    if (Math.abs(dx) > w * 0.25 || flick) animateFlipTo(1, f.dir, f.boundary)
+    const flick = Math.abs(dx) > 40 && (Math.abs(dx) / dt) > 0.25 // px/ms
+    if (Math.abs(dx) > w * 0.12 || flick) animateFlipTo(1, f.dir, f.boundary)
     else animateFlipTo(0, f.dir, f.boundary)
   }
   function onReaderClick(e) {
@@ -1503,7 +1665,7 @@ export default function App() {
             {scanOnStartup && watchedFolders.length > 0 && !watchPromptDismissed && (
               <div className="card">
                 <p><strong>Watched folders saved:</strong> {watchedFolders.map((w) => w.name).join(', ')}.</p>
-                <p className="progress">Android does not let this app reopen a saved folder on its own. Tap Rescan to pick them again and import any new books.</p>
+                <p className="progress">Folders with saved folder access are rescanned automatically on startup. Older folders (no saved access) still need re-picking: tap Rescan and pick the folder again to import any new books.</p>
                 <div className="toolbar">
                   <button onClick={() => { folderPickModeRef.current = 'rescan'; folderRef.current.click() }}>Rescan watched folders</button>
                   <button className="secondary" onClick={() => setWatchPromptDismissed(true)}>Dismiss</button>
@@ -1640,18 +1802,18 @@ export default function App() {
                 <input type="checkbox" checked={volumeKeysTurnPages} onChange={(e) => setVolumeKeysTurnPages(e.target.checked)} />
                 Volume keys turn pages (in the reader: volume down = next page, volume up = previous page; the volume itself does not change while reading)
               </label>
-              <p className="progress">ShelfSort v0.7.1</p>
+              <p className="progress">ShelfSort v0.7.2</p>
             </div>
             <div className="card">
-              <h2>Library folders (re-pick on each scan — Android does not let this app keep folder access between starts)</h2>
-              <p className="progress">Save a folder here and it will be listed below. On startup the app only reminds you to rescan — it cannot silently reopen a saved folder. Rescanning re-opens the phone's folder picker; you pick the folder again and only books not already in the library are imported. No file handles or folder access are stored, only the folder name.</p>
+              <h2>Library folders</h2>
+              <p className="progress">On Android, Add folder opens your phone's system folder picker: navigate to a folder and confirm it with one tap — no selecting individual files, no select-all, no long-press. The app keeps permission for that folder and rescans it automatically on startup (with the toggle below on), importing only books not already in the library. Older folders saved before this, and folders on the web, still work the old way: only the folder name is stored, so they need re-picking on rescan. If a saved folder's permission was revoked or it was moved/deleted, its rescan says so by name instead of silently skipping it. A true folder scan with no re-pick is only possible for these saved-permission folders — the WebView folder/file inputs below remain as a fallback.</p>
               <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <input type="checkbox" checked={scanOnStartup} onChange={(e) => setScanOnStartup(e.target.checked)} />
-                Scan watched folders on startup (show the rescan prompt in the Library)
+                Scan watched folders on startup (saved-permission folders scan automatically; older folders show the rescan prompt in the Library)
               </label>
               <div className="toolbar">
-                <button onClick={() => watchFolderRef.current.click()}>Add folder</button>
-                <button className="secondary" disabled={!watchedFolders.length} onClick={() => { watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() }}>Rescan watched folders</button>
+                <button onClick={() => { if (isNative) addSafFolder(); else watchFolderRef.current.click() }}>Add folder</button>
+                <button className="secondary" disabled={!watchedFolders.length} onClick={() => { if (isNative) rescanAllSafFolders(); else { watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() } }}>Rescan watched folders</button>
               </div>
               <input ref={watchFolderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden webkitdirectory=""
                 onChange={(e) => { const mode = watchPickModeRef.current; watchPickModeRef.current = 'add'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
@@ -1659,9 +1821,15 @@ export default function App() {
                 <p className="progress">No watched folders yet. Add one with the button above.</p>
               ) : (
                 watchedFolders.map((w) => (
-                  <div key={w.name} className="toolbar" style={{ justifyContent: 'space-between' }}>
-                    <span className="progress"><strong>{w.name}</strong>{w.lastCount !== undefined ? ` — ${w.lastCount} book file(s) found on last scan` : ''}</span>
-                    <button className="secondary" onClick={() => setWatchedFolders((prev) => prev.filter((x) => x.name !== w.name))}>Remove</button>
+                  <div key={w.saf ? w.id : w.name} className="toolbar" style={{ justifyContent: 'space-between' }}>
+                    <span className="progress"><strong>{w.name}</strong>{w.saf ? ' · saved folder access' : ''}{w.lastCount !== undefined ? ` — ${w.lastCount} book file(s) found on last scan` : ''}</span>
+                    <span className="toolbar">
+                      <button className="secondary" onClick={() => {
+                        if (w.saf && w.id) rescanSafFolder(w)
+                        else { legacyRescanTargetRef.current = w.name; watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() }
+                      }}>Rescan</button>
+                      <button className="secondary" onClick={() => setWatchedFolders((prev) => prev.filter((x) => w.saf ? !(x.saf && x.id === w.id) : x.name !== w.name))}>Remove</button>
+                    </span>
                   </div>
                 ))
               )}
@@ -1932,7 +2100,7 @@ export default function App() {
                       <div className="reader-flip-stage">
                         <div className="reader-page reader-page-under" style={{ ['--reader-size']: `${fontSize}px` }} dangerouslySetInnerHTML={{ __html: targetPage ? targetPage.html : '' }} />
                         <div className="reader-flip-under-shadow" style={{ opacity: 0.35 * lift, background: flip.dir > 0 ? 'linear-gradient(to right, rgba(0,0,0,0.45), rgba(0,0,0,0) 55%)' : 'linear-gradient(to left, rgba(0,0,0,0.45), rgba(0,0,0,0) 55%)' }} aria-hidden="true" />
-                        <div className="reader-page reader-page-top" style={{ ['--reader-size']: `${fontSize}px`, transform: `rotateY(${angle}deg) scale(${1 - 0.03 * lift}) translateZ(${28 * lift}px)`, transformOrigin: origin }} dangerouslySetInnerHTML={{ __html: cur.html }} />
+                        <div className="reader-page reader-page-top" style={{ ['--reader-size']: `${fontSize}px`, transform: `rotateY(${angle}deg) scale(${1 - 0.03 * lift}) translateZ(${10 * lift}px)`, transformOrigin: origin }} dangerouslySetInnerHTML={{ __html: cur.html }} />
                         <div className="reader-flip-fold" style={{ background: foldBg }} aria-hidden="true" />
                         <div className="reader-flip-shadow" style={{ opacity: 0.55 * lift, background: flip.dir > 0 ? 'linear-gradient(to left, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' : 'linear-gradient(to right, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' }} aria-hidden="true" />
                       </div>
