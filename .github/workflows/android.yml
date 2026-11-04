@@ -37,6 +37,11 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
+      - name: Fix playlist plugin Kotlin version
+        run: |
+          printf '\next {\n    kotlin_version = "2.4.20"\n}\n' >> android/build.gradle
+          sed -i 's/rootProject\.ext\.kotlin_version/kotlin_version/' node_modules/capacitor-plugin-playlist/android/build.gradle
+
       - name: Fix Kotlin duplicate classes
         run: |
           cat >> android/app/build.gradle <<'EOF'
