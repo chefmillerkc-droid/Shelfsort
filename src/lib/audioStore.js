@@ -48,9 +48,61 @@ function chunkToBase64(buf, byteOffset, byteLength) {
   return btoa(out)
 }
 
+// v0.7.4 — STREAMING store (the large-audiobook fix). The old
+// storeAudioFile below takes a whole buffer, and import used to call
+// file.arrayBuffer() TWICE for every audio file (once to parse, once
+// to store). A 629 MB audiobook therefore became an ~840 MB base64
+// string plus a 629 MB buffer, twice over — that is the incomplete
+// import / crash mechanism. This function NEVER holds the whole file:
+// it slices the File/Blob into 3 MiB chunks (a multiple of 3, so each
+// chunk's base64 has no padding and chunks concatenate cleanly),
+// base64-encodes one chunk at a time, and appends it to the Data
+// store, releasing the chunk before reading the next. Peak memory is
+// roughly one chunk plus its base64 (~7 MB), not the file size.
+// On any write failure the partial file is deleted and the error is
+// THROWN (not swallowed to null) — the caller must delete the book
+// meta too, so a failed import leaves no unplayable ghost book and
+// no half-file on disk. Callers must not fall back to an IndexedDB
+// blob for a large audio file after this fails (see importFiles).
+export async function storeAudioFileStream(bookId, fileName, file) {
+  if (!Capacitor.isNativePlatform()) return null
+  if (!file || typeof file.slice !== 'function' || typeof file.size !== 'number') {
+    throw new Error('Audio file cannot be streamed (no slice support)')
+  }
+  const path = audioStorePath(bookId, fileName)
+  const CHUNK = 3 * 1024 * 1024 // 3 MiB, multiple of 3
+  try {
+    let first = true
+    for (let off = 0; off < file.size; off += CHUNK) {
+      const chunkBuf = await file.slice(off, Math.min(file.size, off + CHUNK)).arrayBuffer()
+      const b64 = chunkToBase64(chunkBuf, 0, chunkBuf.byteLength)
+      if (first) {
+        await Filesystem.writeFile({ path, data: b64, directory: Directory.Data, recursive: true })
+        first = false
+      } else {
+        await Filesystem.appendFile({ path, data: b64, directory: Directory.Data })
+      }
+    }
+    if (file.size === 0) throw new Error('Audio file is empty')
+    const uri = await Filesystem.getUri({ path, directory: Directory.Data })
+    if (!uri || !uri.uri) throw new Error('Stored audio file has no URI')
+    return uri.uri
+  } catch (e) {
+    try { await Filesystem.deleteFile({ path, directory: Directory.Data }) } catch { /* already gone */ }
+    throw e
+  }
+}
+
+// Delete a stored audio file, ignoring "not there" errors. Used by
+// import cleanup and by nothing else — playback never deletes.
+export async function deleteStoredAudio(bookId, fileName) {
+  try { await Filesystem.deleteFile({ path: audioStorePath(bookId, fileName), directory: Directory.Data }) } catch { /* ignore */ }
+}
+
 // Returns the file URI to store on the book record, or null if the
 // file could not / should not be stored this way (web, or a write
 // failure — the caller then falls back to the IndexedDB blob).
+// Kept for small files only; audio import uses storeAudioFileStream.
 export async function storeAudioFile(bookId, fileName, buf) {
   if (!Capacitor.isNativePlatform()) return null
   if (!buf || !buf.byteLength) return null

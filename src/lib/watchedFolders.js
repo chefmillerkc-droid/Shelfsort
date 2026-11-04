@@ -80,6 +80,16 @@ export function isSupportedBookFile(file) {
   return /\.(epub|pdf|cbz|cbr|cbt|cb7|m4b|m4a|mp4|mp3)$/i.test(file.name)
 }
 
+// Folder-cover candidates, in priority order (v0.7.4): a book folder
+// from Smart Audiobook Player carries EmbeddedCover.jpg next to the
+// audio file. Matching is case-insensitive on the basename; the
+// first candidate found in a folder wins. These are kilobytes, so
+// reading one whole is fine — unlike the audio file itself.
+export const FOLDER_COVER_NAMES = ['embeddedcover.jpg', 'cover.jpg', 'cover.png', 'folder.jpg']
+export function folderCoverRank(name) {
+  return FOLDER_COVER_NAMES.indexOf(String(name || '').toLowerCase())
+}
+
 // ---- Native SAF (Storage Access Framework) folders (v0.7.2) --------
 // A SAF folder is picked once with the system folder picker and its
 // tree URI is kept (persistable URI permission), so unlike a WebView
@@ -117,7 +127,11 @@ export async function listSafBookFiles(listDir) {
         if (name.startsWith('.')) continue
         await walk(path, depth + 1)
       } else if (isSupportedBookFile(entry)) {
-        found.push({ name, path, dir: relDir || '' })
+        // size passes through when the plugin reports it (readdir
+        // entries carry size) — the SAF audio path uses it to decide
+        // whether a file is safe to byte-parse (<= 50 MB) or must be
+        // played in place with folder-derived metadata instead.
+        found.push({ name, path, dir: relDir || '', size: typeof entry.size === 'number' ? entry.size : null })
       }
     }
   }
@@ -134,6 +148,10 @@ export function lazySafFile(name, readBytes, dir = '') {
   return {
     name,
     dir,
+    // Marker so the audio import path can refuse to whole-read this
+    // file: SAF audio is imported in place (see importSafAudio),
+    // never by reading it through this lazy reader.
+    safRef: true,
     async arrayBuffer() { return readBytes() },
   }
 }

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { getAllBooksMeta, getBookFile, putBookMeta, putBookFile, deleteBookFile, deleteBook, clearLibrary, saveProgressLocal, loadProgressLocal } from './lib/db.js'
-import { parseEpub, parseChapters, fetchAsDataUrl } from './lib/epub.js'
+import { parseEpub, parseChapters, fetchAsDataUrl, blobToDataUrl } from './lib/epub.js'
 import { parsePdf, loadPdf, renderPdfPage, searchPdf } from './lib/pdf.js'
 import { parseComic, loadComicPages } from './lib/comic.js'
 import { parseAudio, parseMp3Tags, formatTime } from './lib/audio.js'
@@ -13,13 +13,13 @@ import { App as CapApp } from '@capacitor/app'
 import { Volume } from '@capawesome/capacitor-volume'
 import { paginateChapterDom, findPageForText, nextPageIndex } from './lib/paginate.js'
 import { cleanDescription } from './lib/description.js'
-import { storeAudioFile } from './lib/audioStore.js'
+import { storeAudioFileStream, deleteStoredAudio } from './lib/audioStore.js'
 import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
 import { exportCatalogFile } from './lib/catalogExport.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
-import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile, listSafBookFiles, lazySafFile, base64ToArrayBuffer, dirOfFile } from './lib/watchedFolders.js'
-import { groupAudioEntries, globalChapters, mapGlobalToPart, resumeForSaved, knownSums } from './lib/multipart.js'
+import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile, listSafBookFiles, lazySafFile, base64ToArrayBuffer, dirOfFile, folderCoverRank } from './lib/watchedFolders.js'
+import { groupAudioEntries, globalChapters, mapGlobalToPart, resumeForSaved, knownSums, cleanFolderName, lastSegmentOfDir, parentSegmentOfDir, naturalCompare } from './lib/multipart.js'
 import { ScopedStorage } from '@daniele-rolli/capacitor-scoped-storage'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
@@ -574,7 +574,24 @@ export default function App() {
     throw new Error('Unsupported file type')
   }
 
-  async function importFiles(fileList) {
+  // Folder covers for a WebView folder pick (v0.7.4): the caller
+  // passes the UNFILTERED picked list so sibling images are visible
+  // here (importFiles itself filters to book files). Keyed by the
+  // file's directory, best priority wins. A cover file is kilobytes,
+  // so reading it whole is fine — unlike the audio file itself.
+  function buildFolderCoverMap(allFiles) {
+    const map = new Map()
+    for (const f of allFiles || []) {
+      const rank = folderCoverRank(f.name)
+      if (rank < 0) continue
+      const dir = dirOfFile(f)
+      const cur = map.get(dir)
+      if (!cur || rank < cur.rank) map.set(dir, { file: f, rank })
+    }
+    return map
+  }
+
+  async function importFiles(fileList, folderCovers) {
     const files = [...fileList].filter((f) => /\.(epub|pdf|cbz|cbr|cbt|cb7|m4b|m4a|mp4|mp3)$/i.test(f.name))
     if (!files.length) { setImportStatus('No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'); return }
     setImportStatus(`Importing ${files.length} file(s)…`)
@@ -584,19 +601,43 @@ export default function App() {
     // One book at a time, committed immediately: meta + file are each
     // written before moving on, so a crash mid-import keeps everything
     // imported so far and the user can simply re-import the rest.
-    // Only one file buffer is alive at a time; nothing is accumulated
-    // — except audio entries, which are collected WITHOUT their
-    // buffers for multi-part grouping below (buffers are re-read
-    // per part when the grouped book is stored, so a multi-hundred-MB
-    // audiobook never sits fully in memory as one group).
+    // Only one file buffer is alive at a time; nothing is accumulated.
+    // AUDIO (v0.7.4 — the large-audiobook fix): an audio entry is
+    // NEVER read whole here. Metadata is parsed from a head slice
+    // only (first 16 MB, where the MP4 moov/ilst/chpl boxes and the
+    // MP3 ID3 header live); the file itself is stored later by
+    // slicing (native) or, for small files on web, by one whole read
+    // of a <= 50 MB file. A moov box at the END of a large file is
+    // therefore NOT parsed: duration is null and chapters are []
+    // for that file, and the native player reports the real duration
+    // once it plays — bookmarks are the documented fallback for
+    // chapterless files. This is stated, not hidden: do not claim
+    // chapters/duration were parsed when they were not.
+    const LARGE_AUDIO = 50 * 1024 * 1024
+    const HEAD_BYTES = 16 * 1024 * 1024
     const audioEntries = []
     for (const file of files) {
       try {
-        const buf = await file.arrayBuffer()
-        const parsed = await parseByFormat(file, buf)
-        if (parsed.format === 'audio') {
+        const isAudio = /\.(m4b|m4a|mp4|mp3)$/i.test(file.name)
+        if (isAudio) {
+          // SAF lazy files never reach this path for audio (the SAF
+          // importer handles them in place — see importSafAudio);
+          // this guard exists so no code path can ever whole-read a
+          // large SAF file by accident.
+          if (file.safRef) throw new Error('Large audio from a watched folder must be imported through that folder, not by file pick')
+          const size = typeof file.size === 'number' ? file.size : null
+          let parsed
+          if (typeof file.slice === 'function') {
+            const head = await file.slice(0, size ? Math.min(size, HEAD_BYTES) : HEAD_BYTES).arrayBuffer()
+            parsed = await parseByFormat(file, head)
+          } else if (size !== null && size <= LARGE_AUDIO) {
+            parsed = await parseByFormat(file, await file.arrayBuffer())
+          } else {
+            throw new Error('Audio file is too large to import by file pick — add its folder as a watched folder instead, so it can play in place')
+          }
           audioEntries.push({
             file,
+            size,
             dir: dirOfFile(file),
             parsed: {
               title: parsed.metadata.title,
@@ -609,6 +650,8 @@ export default function App() {
           })
           continue
         }
+        const buf = await file.arrayBuffer()
+        const parsed = await parseByFormat(file, buf)
         const metadata = { ...parsed.metadata }
         const id = uid()
         const meta = {
@@ -666,22 +709,65 @@ export default function App() {
           hasFile: true,
         }
         await putBookMeta(meta)
-        // Store each part: native file store first (true extension
-        // preserved per audioStore.js), IndexedDB blob under the
-        // part id as the web/HTML fallback. The book-level
-        // audioFileUri is the FIRST part's URI: read-along with a
-        // multi-part book plays part 1 only (documented limit —
-        // read-along is out of scope for the multi-part player).
+        // Store each part (v0.7.4). Native: STREAMING store — the
+        // file is sliced and appended, never held whole, so a
+        // 629 MB part imports with ~7 MB peak memory. Web: a whole
+        // read is allowed ONLY for a <= 50 MB part (the HTML player
+        // needs a blob); a larger part on web fails cleanly instead
+        // of crashing into IndexedDB. The book-level audioFileUri is
+        // the FIRST part's URI: read-along with a multi-part book
+        // plays part 1 only (documented limit — read-along is out of
+        // scope for the multi-part player).
+        // FAILURE CLEANUP (v0.7.4): the old code left the meta (and
+        // any partial store) behind on a store failure — an
+        // unplayable ghost book plus a half-file on disk. Now a
+        // failed group deletes every stored part, every blob part,
+        // and the book meta, and reports a per-file error in plain
+        // words. A failed import leaves nothing behind to re-break
+        // the next startup rescan.
         const audioParts = []
-        for (let i = 0; i < group.entries.length; i++) {
-          const entry = group.entries[i]
-          const partId = isMulti ? `${id}-p${i}` : id
-          const buf = await entry.file.arrayBuffer()
-          const uri = await storeAudioFile(partId, entry.file.name, buf)
-          if (!uri) await putBookFile(partId, buf)
-          audioParts.push({ partId, fileName: entry.file.name, audioFileUri: uri || null, durationSec: entry.parsed.durationSec || null })
+        try {
+          for (let i = 0; i < group.entries.length; i++) {
+            const entry = group.entries[i]
+            const partId = isMulti ? `${id}-p${i}` : id
+            let uri = null
+            if (isNative && typeof entry.file.slice === 'function') {
+              uri = await storeAudioFileStream(partId, entry.file.name, entry.file)
+            } else if (!isNative && entry.size !== null && entry.size <= LARGE_AUDIO) {
+              await putBookFile(partId, await entry.file.arrayBuffer())
+            } else if (!isNative && entry.size === null) {
+              // Unknown size with no slice support: never whole-read
+              // on a guess — this is the SAF-audio path's safety net
+              // (SAF audio is imported in place, never here).
+              throw new Error(`"${entry.file.name}" could not be stored (unknown size, no streaming support)`)
+            } else {
+              throw new Error(`"${entry.file.name}" could not be stored (too large for this import path)`)
+            }
+            audioParts.push({ partId, fileName: entry.file.name, audioFileUri: uri, durationSec: entry.parsed.durationSec || null })
+          }
+        } catch (storeErr) {
+          for (const p of audioParts) {
+            if (p.audioFileUri) await deleteStoredAudio(p.partId, p.fileName)
+            else await deleteBookFile(p.partId)
+          }
+          await deleteBook(id)
+          throw storeErr
         }
-        const update = { ...meta }
+        // Folder cover (v0.7.4): a sibling EmbeddedCover.jpg /
+        // cover.jpg / cover.png / folder.jpg in the same book folder
+        // becomes the book's cover — but ONLY as a fallback. A cover
+        // already parsed from the audio file itself wins. (MP4
+        // parsing in this app does not extract embedded 'covr', so
+        // in practice the folder cover is what a Smart Audiobook
+        // Player folder's book gets.) position.sabp.dat and other
+        // .dat/.txt/.nfo siblings are never book files and never
+        // errors — they are simply not in the book-file list.
+        const update = { ...meta, metadata: { ...meta.metadata } }
+        const embeddedCover = update.metadata.coverDataUrl || update.metadata.coverUrl
+        const coverEntry = !embeddedCover && folderCovers ? folderCovers.get(group.dir) : null
+        if (coverEntry) {
+          try { update.metadata.coverDataUrl = await blobToDataUrl(coverEntry.file) } catch { /* cover is a bonus, never fatal */ }
+        }
         if (isMulti) update.audioParts = audioParts
         if (audioParts[0] && audioParts[0].audioFileUri) update.audioFileUri = audioParts[0].audioFileUri
         await putBookMeta(update)
@@ -706,6 +792,9 @@ export default function App() {
   // folder name matches a saved watched folder, and only files not
   // already in the library — importFiles itself does NOT dedupe).
   async function handleFolderPick(fileList, mode) {
+    // Folder covers come from the UNFILTERED pick (v0.7.4): the
+    // book-file filter below would drop EmbeddedCover.jpg etc.
+    const folderCovers = buildFolderCoverMap([...fileList])
     const files = [...fileList].filter(isSupportedBookFile)
     if (!files.length) {
       const msg = 'No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'
@@ -751,13 +840,13 @@ export default function App() {
         await reload()
         return
       }
-      await importFiles(toImport)
+      await importFiles(toImport, folderCovers)
       setWatchStatus(`Rescan done — imported ${toImport.length} new book(s) from ${Object.keys(found).join(', ')}.`)
       return
     }
     // 'library' and 'add': import everything picked.
     const folderName = folderNameOfFiles(files)
-    await importFiles(files)
+    await importFiles(files, folderCovers)
     if (mode === 'add' && folderName) {
       const count = namedGroups.find(([name]) => name === folderName)?.[1].length ?? files.length
       setWatchedFolders((prev) => {
@@ -790,15 +879,144 @@ export default function App() {
     const found = await listSafBookFiles((path) => safListEntries(w, path))
     return found
   }
+  // SAF audio, imported IN PLACE (v0.7.4 — the large-audiobook
+  // fix). The old path read every SAF file whole through
+  // ScopedStorage.readFile (base64, no offset support) and then
+  // stored a second copy — a 629 MB file became an ~840 MB base64
+  // string plus a 629 MB buffer, twice. That is gone for audio:
+  //   * The file is NEVER read for storage. ScopedStorage
+  //     .getUriForPath gives a content URI for the file where it
+  //     already lives, and that URI is stored as audioFileUri —
+  //     exactly how Smart Audiobook Player treats its folders (no
+  //     629 MB copy). The persistable SAF permission for the
+  //     watched folder keeps the URI valid across starts; if the
+  //     user revokes the permission or moves the folder, playback
+  //     fails with the player's normal error and the folder must be
+  //     re-picked — the app never silently copies the file then.
+  //   * Bytes are parsed ONLY for a file the plugin reports as
+  //     <= 50 MB (or when size is unknown-but-small in practice —
+  //     no: unknown size is treated as large, see below). A larger
+  //     file is never byte-read at all: title comes from the book
+  //     folder name, author from the parent (author) folder name —
+  //     the user's structure already carries both — duration is
+  //     null and chapters are [] (the native player reports the
+  //     real duration once it plays; bookmarks are the documented
+  //     fallback for chapterless files).
+  //   * Dedupe is at GROUP level, not file level: a book folder is
+  //     skipped whole if every part is already in the library, and
+  //     also skipped (counted in skippedPartial) if only SOME parts
+  //     are present — importing the rest as a second book would
+  //     duplicate it. No retroactive merging of already-imported
+  //     separate books, as before.
+  //   * Folder covers: a sibling EmbeddedCover.jpg / cover.jpg /
+  //     cover.png / folder.jpg in the same book folder (first found,
+  //     in that order) becomes the book's cover. Small files, read
+  //     whole as base64 — fine. position.sabp.dat and other
+  //     .dat/.txt/.nfo siblings are ignored, never books or errors.
+  // Returns { imported, skippedPartial, errors } (errors are plain
+  // per-file messages; a failed group creates NO meta and NO copy,
+  // so nothing ghost-like is left behind).
+  async function importSafAudio(w, audioFound, knownFileNames) {
+    const LARGE_AUDIO = 50 * 1024 * 1024
+    const byDir = new Map()
+    for (const f of audioFound) {
+      const dir = f.dir || ''
+      if (!byDir.has(dir)) byDir.set(dir, [])
+      byDir.get(dir).push(f)
+    }
+    let imported = 0
+    let skippedPartial = 0
+    const errors = []
+    // Presence is judged ONLY against the library as it stood
+    // before this scan: two different book folders may legitimately
+    // share a part filename (e.g. part1.m4b in both), and the second
+    // one must not be blocked by the first one imported in this
+    // same scan. So knownFileNames is read-only here.
+    for (const [dir, list] of byDir) {
+      list.sort((a, b) => naturalCompare(a.name, b.name))
+      const present = list.filter((f) => knownFileNames.has(f.name)).length
+      if (present === list.length) continue
+      if (present > 0) { skippedPartial++; continue }
+      const isMulti = list.length > 1
+      const title = dir
+        ? cleanFolderName(lastSegmentOfDir(dir))
+        : list[0].name.replace(/\.(m4b|m4a|mp4|mp3)$/i, '').replace(/[_-]+/g, ' ').trim()
+      const author = dir ? cleanFolderName(parentSegmentOfDir(dir)) : ''
+      try {
+        // URIs first, meta last: nothing is created until every
+        // part has a playable URI, so a failure leaves no meta.
+        const parts = []
+        for (let i = 0; i < list.length; i++) {
+          const f = list[i]
+          const res = await ScopedStorage.getUriForPath({ folder: safFolderRef(w), path: f.path })
+          if (!res || !res.uri) throw new Error(`"${f.name}" has no playable URI in its folder`)
+          let durationSec = null
+          let chapters = []
+          if (typeof f.size === 'number' && f.size <= LARGE_AUDIO) {
+            try {
+              const data = await ScopedStorage.readFile({ folder: safFolderRef(w), path: f.path, encoding: 'base64' })
+              const parsed = await parseByFormat({ name: f.name }, base64ToArrayBuffer(data.data))
+              durationSec = parsed.extra.durationSec || null
+              chapters = parsed.extra.audioChapters || []
+            } catch { /* small-file parse failure: folder metadata stands */ }
+          }
+          parts.push({ fileName: f.name, audioFileUri: res.uri, durationSec, chapters })
+        }
+        const id = uid()
+        const knownDurations = parts.map((p) => p.durationSec).filter((d) => typeof d === 'number' && d > 0)
+        const totalSec = knownDurations.length ? knownDurations.reduce((a, b) => a + b, 0) : null
+        const metadata = { title, author, creators: author ? [author] : [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '' }
+        if (totalSec) metadata.durationSec = totalSec
+        // Folder cover (small read, first candidate that exists).
+        // SAF paths are case-sensitive, so each candidate is tried
+        // in its common casings (the real file here is
+        // EmbeddedCover.jpg, not the lowercased rank key).
+        for (const coverName of ['EmbeddedCover.jpg', 'embeddedcover.jpg', 'cover.jpg', 'Cover.jpg', 'cover.png', 'Cover.png', 'folder.jpg', 'Folder.jpg']) {
+          const coverPath = dir ? `${dir}/${coverName}` : coverName
+          try {
+            const data = await ScopedStorage.readFile({ folder: safFolderRef(w), path: coverPath, encoding: 'base64' })
+            if (data && data.data) {
+              const mime = coverName.endsWith('.png') ? 'image/png' : 'image/jpeg'
+              metadata.coverDataUrl = `data:${mime};base64,${data.data}`
+              break
+            }
+          } catch { /* candidate absent — try the next name */ }
+        }
+        const partsMeta = parts.map((p) => ({ durationSec: p.durationSec, chapters: p.chapters }))
+        const meta = {
+          id,
+          fileName: list[0].name,
+          format: 'audio',
+          metadata,
+          audioChapters: globalChapters(partsMeta),
+          addedAt: Date.now(),
+          progress: null,
+          fixedFields: [],
+          hasFile: true,
+        }
+        if (isMulti) meta.audioParts = parts.map((p, i) => ({ partId: `${id}-p${i}`, fileName: p.fileName, audioFileUri: p.audioFileUri, durationSec: p.durationSec }))
+        if (parts[0]) meta.audioFileUri = parts[0].audioFileUri
+        await putBookMeta(meta)
+        imported++
+      } catch (e) {
+        errors.push(`${list.map((f) => f.name).join(', ')}: ${e.message}`)
+      }
+    }
+    return { imported, skippedPartial, errors }
+  }
+
   // Import one SAF folder's books, deduped against the library by
-  // fileName+format (the same rule as WebView rescan). Returns
+  // fileName+format (the same rule as WebView rescan) for non-audio,
+  // and by whole book folder for audio (see importSafAudio). Returns
   // { found, imported } and updates ONLY this folder's row.
   async function importSafFolder(w) {
     const found = await scanSafFolder(w)
     const existing = await getAllBooksMeta()
-    const toImport = newFilesForRescan(found, existing)
+    const audioFound = found.filter((f) => /\.(m4b|m4a|mp4|mp3)$/i.test(f.name))
+    const otherFound = found.filter((f) => !/\.(m4b|m4a|mp4|mp3)$/i.test(f.name))
+    const toImport = newFilesForRescan(otherFound, existing)
     const lazyByPath = new Map()
-    for (const f of found) {
+    for (const f of otherFound) {
       if (!toImport.some((t) => t.path === f.path)) continue
       lazyByPath.set(f.path, lazySafFile(f.name, async () => {
         const res = await ScopedStorage.readFile({ folder: safFolderRef(w), path: f.path, encoding: 'base64' })
@@ -815,13 +1033,29 @@ export default function App() {
       const lazy = lazyByPath.get(t.path)
       if (lazy) lazyFiles.push(lazy)
     }
+    // Audio in place FIRST (no bytes read for large files), then
+    // non-audio through the normal path. Import status/errors for
+    // SAF audio live on the watch status, not the import panel:
+    // setImportErrors would be overwritten by the non-audio import.
+    const knownFileNames = new Set()
+    for (const b of existing) {
+      if (b.fileName) knownFileNames.add(b.fileName)
+      for (const p of b.audioParts || []) if (p.fileName) knownFileNames.add(p.fileName)
+    }
+    const audioRes = audioFound.length ? await importSafAudio(w, audioFound, knownFileNames) : { imported: 0, skippedPartial: 0, errors: [] }
     if (lazyFiles.length) await importFiles(lazyFiles)
     else await reload()
+    const audioNote = [
+      audioRes.imported ? `${audioRes.imported} audiobook(s) linked in place` : '',
+      audioRes.skippedPartial ? `${audioRes.skippedPartial} audiobook folder(s) skipped (partly imported already — remove the old entries first, then rescan)` : '',
+      audioRes.errors.length ? `audio errors: ${audioRes.errors.join('; ')}` : '',
+    ].filter(Boolean).join(' — ')
+    if (audioNote) setWatchStatus(audioNote)
     setWatchedFolders((prev) => prev.map((x) => (
       x.saf && x.id === w.id
         ? { ...x, lastCount: found.length, lastScannedAt: Date.now() } : x
     )))
-    return { found: found.length, imported: lazyFiles.length }
+    return { found: found.length, imported: lazyFiles.length + audioRes.imported }
   }
   async function addSafFolder() {
     let picked
@@ -2119,7 +2353,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.3</p>
+              <p className="progress">ShelfSort v0.7.4</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
