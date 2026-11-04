@@ -67,6 +67,16 @@ export default function App() {
   const [proposals, setProposals] = useState([])
   const [enriching, setEnriching] = useState(false)
   const [enrichStatus, setEnrichStatus] = useState('')
+  // Auto-apply high-confidence fixes (only ask when unsure).
+  // Default ON; turning it off restores ask-every-time behaviour.
+  const [autoApplyHigh, setAutoApplyHigh] = useState(() => {
+    try { return localStorage.getItem('shelfsort-auto-apply-high') !== 'off' } catch { return true }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('shelfsort-auto-apply-high', autoApplyHigh ? 'on' : 'off') } catch { /* ignore */ }
+  }, [autoApplyHigh])
+  // Concise summary of the last Find Fixes run's auto-applied fixes.
+  const [autoFixedSummary, setAutoFixedSummary] = useState([])
   const [edits, setEdits] = useState({})
   const [chapters, setChapters] = useState([])
   const [chapterIndex, setChapterIndex] = useState(0)
@@ -182,31 +192,13 @@ export default function App() {
   }
 
   // ---- Enrichment / Fix Review ---------------------------------------
-  async function runEnrichment() {
-    setEnriching(true)
-    setEnrichStatus('Checking books for missing metadata…')
-    setProposals([])
-    const found = []
-    for (let i = 0; i < books.length; i++) {
-      setEnrichStatus(`Checking ${i + 1} of ${books.length}: ${books[i].metadata.title}`)
-      try {
-        const result = await enrichBook(books[i])
-        if (result) found.push(result)
-      } catch { /* a failed lookup is not a failed book */ }
-    }
-    setProposals(found)
-    const initial = {}
-    for (const p of found) initial[p.bookId] = { ...p.proposals }
-    setEdits(initial)
-    setEnriching(false)
-    setEnrichStatus(found.length ? `Found proposed fixes for ${found.length} book(s). Review them below — nothing has been applied yet.` : 'No fixes found. Your books may already be complete, or the sources had no match.')
-    setView('fixes')
-  }
-
-  async function applyProposal(bookId, values) {
-    const book = books.find((b) => b.id === bookId)
-    if (!book) return
+  // Shared writer for one book's fixes. When `auto` is true, the fix
+  // is also recorded on the book (autoApplied) so the detail page
+  // can show exactly what was auto-applied and when — and the user
+  // can correct it with the manual edit form there.
+  async function applyValuesToBook(book, values, autoInfo) {
     const updated = { ...book, metadata: { ...book.metadata }, fixedFields: [...(book.fixedFields || [])] }
+    const appliedFields = []
     for (const [field, value] of Object.entries(values)) {
       if (field === 'coverUrl') {
         try {
@@ -216,12 +208,90 @@ export default function App() {
           updated.metadata.coverUrl = value
         }
         if (!updated.fixedFields.includes('cover')) updated.fixedFields.push('cover')
+        appliedFields.push('cover')
       } else {
         updated.metadata[field] = value
         if (!updated.fixedFields.includes(field)) updated.fixedFields.push(field)
+        appliedFields.push(field)
       }
     }
+    if (autoInfo && appliedFields.length) {
+      updated.autoApplied = [...(book.autoApplied || []), {
+        fields: appliedFields,
+        source: autoInfo.source,
+        confidenceReason: autoInfo.confidenceReason,
+        appliedAt: Date.now(),
+      }]
+    }
     await putBook(updated)
+    return updated
+  }
+
+  async function runEnrichment() {
+    setEnriching(true)
+    setEnrichStatus('Checking books for missing metadata…')
+    setProposals([])
+    setAutoFixedSummary([])
+    const review = []
+    const autoSummary = []
+    // Snapshot the library at run start: auto-applying mutates books,
+    // so later lookups must not re-read the mutated state mid-run.
+    const snapshot = [...books]
+    for (let i = 0; i < snapshot.length; i++) {
+      setEnrichStatus(`Checking ${i + 1} of ${snapshot.length}: ${snapshot[i].metadata.title}`)
+      try {
+        const result = await enrichBook(snapshot[i])
+        if (!result) continue
+        // High-confidence, auto-apply ON: apply immediately, no prompt.
+        // The review-only remainder (e.g. a non-ISBN cover) still
+        // goes to Fix Review, even for a high-confidence book.
+        if (autoApplyHigh && Object.keys(result.autoProposals || {}).length) {
+          const updated = await applyValuesToBook(snapshot[i], result.autoProposals, {
+            source: result.source,
+            confidenceReason: result.confidenceReason,
+          })
+          const fields = Object.keys(result.autoProposals).map((f) => (f === 'coverUrl' ? 'cover' : f))
+          autoSummary.push({
+            bookId: snapshot[i].id,
+            title: updated.metadata.title || snapshot[i].metadata.title,
+            fields,
+            source: result.source,
+            confidenceReason: result.confidenceReason,
+          })
+        }
+        // Toggle OFF restores ask-every-time: the full proposal set,
+        // including high-confidence fields, goes to Fix Review.
+        const reviewFields = autoApplyHigh ? (result.reviewProposals || {}) : (result.proposals || {})
+        if (Object.keys(reviewFields).length) {
+          review.push({ ...result, proposals: reviewFields })
+        }
+      } catch { /* a failed lookup is not a failed book */ }
+    }
+    setProposals(review)
+    const initial = {}
+    for (const p of review) initial[p.bookId] = { ...p.proposals }
+    setEdits(initial)
+    setAutoFixedSummary(autoSummary)
+    await reload()
+    setEnriching(false)
+    const autoPart = autoSummary.length
+      ? `${autoSummary.length} book(s) auto-fixed (high confidence only — see below).`
+      : ''
+    const reviewPart = review.length
+      ? `${review.length} book(s) need your review (uncertain fixes below).`
+      : 'No uncertain fixes need review.'
+    setEnrichStatus(
+      (!autoSummary.length && !review.length)
+        ? 'No fixes found. Your books may already be complete, or the sources had no match.'
+        : `${autoPart} ${reviewPart}`.trim(),
+    )
+    setView('fixes')
+  }
+
+  async function applyProposal(bookId, values) {
+    const book = books.find((b) => b.id === bookId)
+    if (!book) return
+    await applyValuesToBook(book, values, null)
     setProposals((prev) => prev.filter((p) => p.bookId !== bookId))
     await reload()
   }
@@ -464,6 +534,10 @@ export default function App() {
           </button>
           <button onClick={() => { setSelected(null); setView('library') }}>Library</button>
           <button className="secondary" onClick={() => setView('cloud')}>☁️ Cloud / Settings</button>
+          <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
+            Auto-apply high-confidence fixes (only ask when unsure)
+          </label>
           <button className="secondary" onClick={runEnrichment} disabled={enriching || !books.length}>
             {enriching ? 'Checking…' : 'Find fixes'}
           </button>
@@ -564,6 +638,15 @@ export default function App() {
                 <p>Series: {detail.metadata.series || getSeries(detail).name || '—'} {detail.metadata.seriesIndex ? `#${detail.metadata.seriesIndex}` : ''}</p>
                 <p>{detail.metadata.description || 'No description in this file.'}</p>
                 <p>☁️ Cloud: {cloudStatusLabel(detail)}{detail.r2Key ? ` · ${detail.r2Key}` : ''}</p>
+                {detail.autoApplied && detail.autoApplied.length > 0 && (
+                  <div className="notice">
+                    <strong>Auto-fixed (high confidence only):</strong>
+                    {detail.autoApplied.map((a, i) => (
+                      <div key={i}>✓ {a.fields.join(', ')} — {a.source} ({a.confidenceReason}){a.appliedAt ? ` · ${new Date(a.appliedAt).toLocaleDateString()}` : ''}</div>
+                    ))}
+                    <div className="progress">If any of these are wrong, correct them with “Edit metadata” below — auto-apply is never irreversible.</div>
+                  </div>
+                )}
                 {cloudProgress && <p className="progress">{cloudProgress}</p>}
                 {cloudMsg && <p className="progress">{cloudMsg}</p>}
                 <div className="toolbar">
@@ -741,7 +824,22 @@ export default function App() {
             <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
             <h2>Fix Review</h2>
             <p>{enrichStatus}</p>
-            <p className="progress">Nothing here is applied until you press Apply. Edit any proposed value before applying it.</p>
+            <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
+              Auto-apply high-confidence fixes (only ask when unsure) — turn off to ask every time
+            </label>
+            {autoFixedSummary.length > 0 && (
+              <div className="card">
+                <h3>✓ Auto-fixed (high confidence only)</h3>
+                <p className="progress">These were applied immediately, without a prompt, because they met the high-confidence rule. Anything uncertain is in the review list below. If an auto-fix is wrong, open the book's detail page and correct it with “Edit metadata”.</p>
+                {autoFixedSummary.map((a) => (
+                  <div key={a.bookId}>
+                    <strong>{a.title}</strong> — {a.fields.join(', ')} · {a.source} ({a.confidenceReason})
+                  </div>
+                ))}
+              </div>
+            )}
+            <p className="progress">Nothing in the review list below is applied until you press Apply. Edit any proposed value before applying it.</p>
             {proposals.length > 0 && <button onClick={applyAllProposals}>Apply all proposed fixes</button>}
             {proposals.map((p) => {
               const book = books.find((b) => b.id === p.bookId)
