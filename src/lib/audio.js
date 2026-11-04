@@ -153,6 +153,7 @@ export function parseAudio(arrayBuffer, fallbackName = 'Unknown audiobook') {
 
   return {
     title,
+    titleFromFilename: !(meta['©nam'] || meta['nam']),
     author,
     creators: author ? [author] : [],
     language: '',
@@ -192,6 +193,7 @@ export function parseMp3Tags(arrayBuffer, fallbackName = 'Unknown audiobook') {
     pos += 10 + size
   }
   if (!out.title) out.title = fallbackName.replace(/\.(mp3)$/i, '').replace(/[_-]+/g, ' ').trim()
+  out.titleFromFilename = !out.title || out.title === fallbackName.replace(/\.(mp3)$/i, '').replace(/[_-]+/g, ' ').trim()
   return out
 }
 

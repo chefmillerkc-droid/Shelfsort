@@ -112,3 +112,161 @@ No data leaves your device except (a) enrichment queries: when you press “Find
 - **M4B chapters:** only Nero `chpl` chapters are parsed. QuickTime chapter tracks (a separate text track) are not decoded in this build, so an M4B whose chapters live only in a chapter track will show as "no embedded chapters" — bookmarks and saved position still work.
 - **Read-along:** chapter-level only, as above. It does not do word-level narration sync, and it does not invent chapter timings when the audiobook has none.
 - **Runtime testing in this environment:** the production build passes, and CBZ natural ordering, M4B `chpl` chapter parsing, read-along matching/mapping, and series gaps were tested with generated sample files in Node. PDF rendering and EPUB chapter rendering run in the browser (DOM/canvas) and were not executed against a real file in this headless environment — import a real PDF/EPUB/CBZ/M4B in `npm run dev` as a smoke test before relying on it.
+
+## v0.4.0 — split storage (crash/persistence fix) + clean library UI
+
+**The problem this fixes:** with only ~300 EPUBs imported, the old build loaded
+every book's whole file into memory on launch (EPUB parsing via JSZip plus
+whole-file blobs in the library load), crashed after about a minute, and then
+showed an empty library on reopen — because the import had crashed before
+finishing. EPUBs alone were enough to trigger it; no PDFs, comics, or audio
+were involved.
+
+**Split storage + migration:**
+- IndexedDB is now two stores: `books-meta` (metadata, cover, series,
+  progress, links, `r2Key`, `fileName`, `format`, `hasFile` — no file blob)
+  and `books-files` (id → ArrayBuffer).
+- The library list, search, sort, series grouping, and Find Fixes all run
+  off metadata only, so loading 300 books is trivially stable.
+- A book's file is loaded only when that book is actually opened
+  (EPUB reader, PDF, comic, audio, read-along, corrected-EPUB export), and
+  released when you leave the viewer.
+- Import is sequential, one book at a time, committing meta + file per book
+  immediately, with `Imported X of Y — <title>` status. A crash mid-import
+  keeps everything imported so far; re-import the rest.
+- Migration from v1 is automatic and idempotent: old `books` records are
+  split into meta + file (skipping ids already migrated), then the old
+  store is deleted on a second upgrade step. Existing imported books
+  survive; no file is lost. If migration is interrupted, the next launch
+  re-runs it without clobbering edited metadata.
+
+**Clean library UI (from the reference screenshots):**
+- Dark-first top bar: `Library`, a search icon, a List/Grid toggle, and a
+  Settings menu — no header crammed with Cloud/Find-fixes/checkbox buttons.
+  Cloud/Settings, Find fixes, and Clear library live on a Settings screen.
+- List view: cover left, title + author right, thin progress bar under
+  the cover, with ALL / NEW / STARTED / FINISHED tabs (NEW = no progress,
+  STARTED = progress set, FINISHED = finished flag, set when the EPUB
+  reader reaches the last chapter or toggled on the detail page).
+- Grid view: 3-column covers, with title + author under each cover in
+  small, muted text so the covers stay the focus (revised from the
+  original covers-only grid at the user's request).
+- Series view: a separate screen with tag rows, series name, and book
+  count on the right; tapping a series shows its books in order with
+  gaps noted. Series is a view, not just a sort mode.
+- Book cards show only cover + title + author (+ progress bar in list
+  view). Cloud status, auto-fixed notes, series lines, and read-along
+  lines moved to the detail page only.
+- Sort options are now: Series, Author, Title, Publication date,
+  Recently added. Publication date sorts newest first, with books that
+  have no usable date last; `metadata.date` may be a year, a full date,
+  or empty/malformed — the year is parsed robustly and never crashes.
+
+**Not yet device-tested:** this build passes `npm run build` and the
+migration/import/sort paths were logic-checked by reading the code back,
+but no real device import of 300 EPUBs was run here. After pushing, the
+APK rebuild must be smoke-tested on the phone (import a few EPUBs, close
+and reopen the app, open one book) before trusting it with a full import.
+
+## v0.5.0 — native audio player, paginated EPUB reader, pull-to-refresh, Unsorted shelf
+- **Bottom format tabs:** fixed bottom bar on Library / Series / Unsorted — All, Books (EPUB + PDF), Comics (CBZ/CBR), Audiobooks (M4B/MP3), each with a count. Tapping a tab filters the list below; the choice is remembered. This replaces the old format dropdown.
+- **App icon + splash:** `assets/icon.png.b64` / `assets/splash.png.b64` are base64 text of the 1024×1024 icon and 2732×2732 splash (Muse's GitHub push handles text files only, so PNGs are stored this way). The APK workflow decodes them to `assets/icon.png` / `assets/splash.png` before running `@capacitor/assets generate --android`.
+
+**Native audio player (the big one):**
+- Playback is now `capacitor-plugin-playlist` v8.0.0 on native platforms
+  (Capacitor 8+, `@capacitor/core` ^8, `@capacitor/filesystem` ^8), with
+  `src/lib/nativeAudio.js` as the wrapper. Android uses the plugin's
+  media3 / ExoPlayer + MediaSessionService + foreground `mediaPlayback`
+  service, so M4B/MP3 playback keeps going when the app is backgrounded
+  or the screen locks, with lock-screen / notification play-pause
+  controls from the plugin's MediaStyle notification. No second custom
+  notification is built here.
+- The plugin's AndroidManifest (merged automatically by `cap sync`)
+  already includes `WAKE_LOCK`, `FOREGROUND_SERVICE`,
+  `FOREGROUND_SERVICE_MEDIA_PLAYBACK` and the MediaService — do not edit
+  AndroidManifest by hand (android/ is generated on the GitHub runner).
+- What stays custom in ShelfSort: the player UI, chapter list, bookmarks,
+  sleep timer, speed, and progress saving. All are preserved: play/pause,
+  seek slider, current/total time, ±15s/±30s, speed 0.5–2×, sleep timer
+  15/30/60, bookmarks, Nero-chapter list (seek to chapter start), progress
+  saved every 5+ seconds and on pause/back, saved-position resume.
+- The plugin can only play a real file URI, so the audio book's bytes are
+  copied to Capacitor's Cache directory (stable filename per book id,
+  chunked base64 copy, reused when the cached size matches the library
+  file). Clearing the app cache does NOT delete the library file in
+  IndexedDB — the cache copy is rebuilt on the next open. Cover art is
+  likewise written to cache when it is a data: URL, so MediaSession can
+  show it.
+- Web / Pages, and any native failure, fall back to the existing HTML
+  `<audio>` path — never silence. The player screen shows which backend
+  is active ("Native player" vs "In-app player (web fallback)").
+- Leaving the standalone player screen does NOT pause native playback
+  (that is the point); a new book replaces the playlist, and pausing
+  from the app or the notification stops it. The sleep timer lives in
+  the player screen only and is cleared if you leave it.
+- Read-along uses the same native controller, driven by its status
+  position events (throttled / suppressed while backgrounded — fine,
+  read-along is a foreground activity). Unlike the standalone player,
+  leaving read-along DOES pause, matching the old HTML behaviour there.
+- Android 13+ POST_NOTIFICATIONS — known limitation, not faked: the
+  plugin does not merge that permission and this codebase has no
+  permissions plugin, so no runtime request is attempted. If the
+  notification does not appear, allow notifications for ShelfSort in
+  system settings (Settings > Apps > ShelfSort > Notifications).
+  Playback itself is unaffected.
+- NOT device-tested yet: background playback, lock-screen controls and
+  notification controls must be tested on the phone (play an M4B,
+  background the app / lock the screen, confirm it keeps playing and
+  the notification controls work, reopen and confirm position saved).
+
+**EPUB reader paginates (page-turn, not scroll):**
+- Chapter content is laid out in CSS columns (one column = one
+  screen-sized page) and translated horizontally by page index.
+  Page count is measured from the rendered layout, so it follows font
+  size and viewport instead of guessing from character counts.
+- Tap the right side / swipe left = next page, tap the left side /
+  swipe right = previous page (middle taps and links are untouched).
+  The last page of a chapter advances to the next chapter; the first
+  page of a chapter goes back to the previous chapter's last page.
+- Page indicator: "Page X of Y · Chapter A of B". Font-size control and
+  light/dark/sepia themes are unchanged; changing font size repaginates
+  and keeps your proportional place. The chapter dropdown jumps to
+  chapter page 1. In-book search jumps to the chapter and the estimated
+  page containing the hit (character position within the chapter —
+  an estimate, since columns fill in order).
+- Progress is now chapter + page, so reopening returns to the same page.
+  Old progress records with only `chapterIndex` still load at that
+  chapter's first page. A book is only marked finished when its last
+  chapter's last page is reached (or toggled on the detail page).
+  Read-along's EPUB pane still scrolls — pagination is EPUB-reader only.
+
+**Pull-to-refresh:**
+- On Library (list/grid), Series and Unsorted views only: swipe down
+  when already scrolled to the top to reload library metadata from
+  IndexedDB, with a "Pull to refresh / Release to refresh /
+  Refreshing…" indicator. It never triggers on reader, detail, audio
+  or settings screens, and it does not intercept normal scrolling
+  (it only arms when the page is at the top). No new dependencies;
+  plain touchstart/touchmove/touchend handling.
+
+**Import first, fix second — Unsorted shelf:**
+- Import uploads everything as-is. Import never runs enrichment and
+  never blocks on it (this was already true in v0.4; it is now the
+  documented flow, with the scan made explicitly opt-in).
+- Unsorted shelf (top navigation, with a count, like
+  the Series view): no series AND (author missing OR cover missing OR
+  the title was derived from the filename because the file had no
+  title metadata). Parsers now record `titleFromFilename` for EPUB,
+  PDF, CBZ, M4B and MP3 (CBZ titles are always filename-derived;
+  pre-v0.5 records fall back to comparing the title with the cleaned
+  filename stem). Standalone books with a real title, author and
+  cover are NOT Unsorted just for having no series.
+- Find Fixes is now scoped, in Settings and on the Unsorted screen:
+  "Scan Unsorted shelf (N)" is the prominent default; "Find fixes
+  (all books)" is kept as the second option. Scoped runs use the
+  existing high-confidence auto-apply rule, with uncertain fixes going
+  to Fix Review. The shelf is computed from metadata on every render,
+  so a book leaves it automatically once a fix or manual edit supplies
+  author + cover + series (or a real title + author + cover) — a
+  supplied title clears `titleFromFilename`, a manual title change
+  does the same.

@@ -125,6 +125,7 @@ export async function parseEpub(arrayBuffer, fallbackName = 'Unknown book') {
 
   return {
     title,
+    titleFromFilename: !getDc('title'),
     creators,
     author: creators.join(', '),
     language: getDc('language'),

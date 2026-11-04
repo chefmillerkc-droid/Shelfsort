@@ -36,6 +36,7 @@ export async function parsePdf(arrayBuffer, fallbackName = 'Unknown document') {
   const clean = fallbackName.replace(/\.(pdf)$/i, '').replace(/[_-]+/g, ' ').trim()
   return {
     title: title || clean,
+    titleFromFilename: !title,
     author: author || '',
     creators: author ? [author] : [],
     language: '',

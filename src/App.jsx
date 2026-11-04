@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { getAllBooks, putBook, deleteBook, clearLibrary, saveProgressLocal, loadProgressLocal } from './lib/db.js'
+import { getAllBooksMeta, getBookFile, putBookMeta, putBookFile, deleteBookFile, deleteBook, clearLibrary, saveProgressLocal, loadProgressLocal } from './lib/db.js'
 import { parseEpub, parseChapters, fetchAsDataUrl } from './lib/epub.js'
 import { parsePdf, loadPdf, renderPdfPage, searchPdf } from './lib/pdf.js'
 import { parseCbz, getCbzPageBlob, isCbrFile } from './lib/comic.js'
 import { parseAudio, parseMp3Tags, formatTime } from './lib/audio.js'
 import { enrichBook } from './lib/enrich.js'
 import { groupBySeries, getSeries, sortBooks } from './lib/series.js'
+import { createAudioController } from './lib/nativeAudio.js'
 import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
 import {
@@ -30,25 +31,88 @@ function formatLabel(book) {
   return 'EPUB'
 }
 
-function BookCard({ book, onOpen }) {
+// Unsorted shelf — IMPORT FIRST, FIX SECOND.
+// A book lands here when it could not be sorted confidently:
+//   no series AND (author missing OR cover missing OR the title was
+//   derived from the filename because the file had no title metadata).
+// A standalone book with a real title, author and cover is NOT
+// Unsorted just for having no series. This is computed from the
+// metadata on every render, never stored as a flag, so a book leaves
+// the shelf automatically as soon as a fix or manual edit supplies
+// author + cover + series (or a real title + author + cover).
+// Old library records predate titleFromFilename: for them the title
+// is treated as filename-derived when it exactly matches the cleaned
+// filename stem.
+export function titleIsFilenameDerived(book) {
+  const m = book.metadata || {}
+  if (typeof m.titleFromFilename === 'boolean') return m.titleFromFilename
+  const stem = (book.fileName || '').replace(/\.[a-z0-9]+$/i, '').replace(/[_-]+/g, ' ').trim().toLowerCase()
+  return !!stem && (m.title || '').trim().toLowerCase() === stem
+}
+
+export function isUnsorted(book) {
+  const m = book.metadata || {}
+  if (getSeries(book).name) return false
+  const authorMissing = !(m.author || '').trim()
+  const coverMissing = !(m.coverDataUrl || m.coverUrl)
+  return authorMissing || coverMissing || titleIsFilenameDerived(book)
+}
+
+// Reading status, from progress only (no file access needed).
+// NEW = never opened, STARTED = progress set, FINISHED = finished flag
+// (set when the reader reaches the last chapter, or toggled on detail).
+export function statusOf(book) {
+  const pr = book.progress
+  if (pr && pr.finished) return 'finished'
+  if (!pr) return 'new'
+  if (pr.chapterIndex || pr.page || pr.positionSec || (pr.bookmarks && pr.bookmarks.length)) return 'started'
+  return 'new'
+}
+
+// 0..1 progress fraction for the thin bar under a list cover.
+// EPUB uses chapterIndex/totalChapters (saved when chapters load);
+// PDF/comic use page/pageCount; audio uses position/duration.
+export function progressFraction(book) {
+  const pr = book.progress
+  if (!pr) return 0
+  if (pr.finished) return 1
+  if (pr.totalChapters && pr.chapterIndex !== undefined) return Math.min(1, (pr.chapterIndex + 1) / pr.totalChapters)
+  if (pr.page && book.metadata.pageCount) return Math.min(1, pr.page / book.metadata.pageCount)
+  if (pr.positionSec && book.metadata.durationSec) return Math.min(1, pr.positionSec / book.metadata.durationSec)
+  if (pr.chapterIndex) return 0.1
+  if (pr.page) return 0.1
+  if (pr.positionSec) return 0.1
+  return 0
+}
+
+// List view (reference screenshot 1): cover left, title + author right,
+// thin progress bar under the cover. Nothing else on the card.
+function BookRow({ book, onOpen }) {
   const cover = coverFor(book)
-  const s = getSeries(book)
-  const prog = book.progress
+  const frac = progressFraction(book)
   return (
-    <button className="book" onClick={() => onOpen(book)}>
+    <button className="book-row" onClick={() => onOpen(book)}>
+      <span className="row-cover">
+        {cover ? <img src={cover} alt="" /> : <span className="cover">No cover</span>}
+        <span className="row-progress"><span style={{ width: `${Math.round(frac * 100)}%` }} /></span>
+      </span>
+      <span className="row-text">
+        <span className="row-title">{book.metadata.title}</span>
+        <span className="row-author">{book.metadata.author || 'Unknown author'}</span>
+      </span>
+    </button>
+  )
+}
+
+// Grid view (reference screenshot 2): cover, with title + author under it,
+// small and muted so the cover stays the focus.
+function BookGridCard({ book, onOpen }) {
+  const cover = coverFor(book)
+  return (
+    <button className="book-grid" onClick={() => onOpen(book)} aria-label={book.metadata.title}>
       {cover ? <img src={cover} alt="" /> : <div className="cover">No cover</div>}
-      <h3>{book.metadata.title}</h3>
-      <p>{book.metadata.author || 'Unknown author'}</p>
-      <p className="format-badge">{formatLabel(book)}
-        {book.format === 'pdf' && book.metadata.pageCount ? ` · ${book.metadata.pageCount} pages` : ''}
-        {book.format === 'comic' && book.metadata.pageCount ? ` · ${book.metadata.pageCount} pages` : ''}
-        {book.format === 'audio' && book.metadata.durationSec ? ` · ${formatTime(book.metadata.durationSec)}` : ''}
-        {book.format === 'audio' && prog && prog.positionSec ? ` · ▶ ${formatTime(prog.positionSec)}` : ''}
-      </p>
-      <p>{cloudStatusLabel(book)}</p>
-      {s.name && <p>📚 {s.name}{s.index !== null ? ` #${s.index}` : ''}</p>}
-      {book.linkedAudioId && <p>🎧 Read-along linked</p>}
-      {book.fixedFields && book.fixedFields.length > 0 && <p>✓ Fixed: {book.fixedFields.join(', ')}</p>}
+      <span className="book-grid-title">{book.metadata.title}</span>
+      <span className="book-grid-author">{book.metadata.author || 'Unknown author'}</span>
     </button>
   )
 }
@@ -59,8 +123,28 @@ export default function App() {
   const [selected, setSelected] = useState(null)
   const [search, setSearch] = useState('')
   const [sortMode, setSortMode] = useState('series')
-  const [formatFilter, setFormatFilter] = useState('all')
-  const [expanded, setExpanded] = useState({})
+  const [formatTab, setFormatTab] = useState(() => { try { return localStorage.getItem('shelfsort-format-tab') || 'all' } catch { return 'all' } })
+  useEffect(() => { try { localStorage.setItem('shelfsort-format-tab', formatTab) } catch { /* ignore */ } }, [formatTab])
+  // Bottom tabs: Books = EPUB + PDF, Comics = CBZ/CBR, Audiobooks = M4B/MP3.
+  function matchesFormatTab(b) {
+    if (formatTab === 'books') return b.format === 'epub' || b.format === 'pdf'
+    if (formatTab === 'comics') return b.format === 'comic'
+    if (formatTab === 'audiobooks') return b.format === 'audio'
+    return true
+  }
+  const [viewMode, setViewMode] = useState(() => { try { return localStorage.getItem('shelfsort-view') || 'list' } catch { return 'list' } })
+  const [statusTab, setStatusTab] = useState('all')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [seriesDetail, setSeriesDetail] = useState(null)
+  // Files for books currently OPEN only (0-2 books). The library list
+  // itself is metadata-only, so 300 books never means 300 blobs in RAM.
+  const [openFiles, setOpenFiles] = useState({})
+  useEffect(() => { try { localStorage.setItem('shelfsort-view', viewMode) } catch { /* ignore */ } }, [viewMode])
+  // Release open files whenever we leave a viewer/detail screen.
+  useEffect(() => {
+    if (['library', 'series', 'series-detail', 'unsorted', 'settings', 'cloud', 'fixes'].includes(view)) setOpenFiles({})
+  }, [view])
+  function withFile(meta) { return meta ? { ...meta, file: openFiles[meta.id] } : null }
   const [importStatus, setImportStatus] = useState('')
   const [importErrors, setImportErrors] = useState([])
   const [drag, setDrag] = useState(false)
@@ -85,13 +169,29 @@ export default function App() {
   const [readerSearch, setReaderSearch] = useState('')
   const [readerHits, setReaderHits] = useState([])
   const [exporting, setExporting] = useState(false)
+  // EPUB pagination (page-turn, not scroll). pageCount is measured
+  // from the CSS-column layout (see the repaginate effect below);
+  // pageIndexRef mirrors pageIndex without re-running that effect.
+  const [pageIndex, setPageIndex] = useState(0)
+  const [pageCount, setPageCount] = useState(1)
+  const pageRef = useRef(null)
+  const pageIndexRef = useRef(0)
+  const pageCountRef = useRef(1)
+  const pagePendingRef = useRef(null) // 'last' | fraction 0..1 | null
+  const prevReaderFontRef = useRef(fontSize)
+  const prevReaderChapterRef = useRef(0)
+  // Pull-to-refresh (library + series views only).
+  const [pullDist, setPullDist] = useState(0)
+  const [ptrRefreshing, setPtrRefreshing] = useState(false)
+  const ptrStartY = useRef(null)
+  const pullDistRef = useRef(0)
   // App-wide light/dark mode: persisted, system preference on first load.
   const [appTheme, setAppTheme] = useState(() => {
     try {
       const saved = localStorage.getItem('shelfsort-theme')
       if (saved === 'light' || saved === 'dark') return saved
     } catch { /* ignore */ }
-    return (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light'
+    return 'dark'
   })
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', appTheme)
@@ -116,8 +216,10 @@ export default function App() {
   const fileRef = useRef(null)
   const folderRef = useRef(null)
 
+  // Metadata only — this is the fix for the 300-book crash/empty-library
+  // cycle: loading the library must NEVER pull 300 file blobs into RAM.
   async function reload() {
-    const all = await getAllBooks()
+    const all = await getAllBooksMeta()
     setBooks(all)
     return all
   }
@@ -139,7 +241,7 @@ export default function App() {
     if (/\.cbr$/i.test(name)) {
       // RAR cannot be opened in this browser build — detected, not faked.
       const clean = name.replace(/\.cbr$/i, '').replace(/[_-]+/g, ' ').trim()
-      return { format: 'comic', metadata: { title: clean, author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 }, extra: { cbrUnsupported: true } }
+      return { format: 'comic', metadata: { title: clean, titleFromFilename: true, author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 }, extra: { cbrUnsupported: true } }
     }
     if (/\.m4b$/i.test(name)) {
       const parsed = parseAudio(buf, name)
@@ -147,7 +249,7 @@ export default function App() {
     }
     if (/\.mp3$/i.test(name)) {
       const tags = parseMp3Tags(buf, name)
-      return { format: 'audio', metadata: { title: tags.title, author: tags.author, creators: tags.author ? [tags.author] : [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '' }, extra: { audioChapters: [], durationSec: null } }
+      return { format: 'audio', metadata: { title: tags.title, titleFromFilename: tags.titleFromFilename, author: tags.author, creators: tags.author ? [tags.author] : [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '' }, extra: { audioChapters: [], durationSec: null } }
     }
     throw new Error('Unsupported file type')
   }
@@ -159,18 +261,20 @@ export default function App() {
     setImportErrors([])
     const errors = []
     let imported = 0
+    // One book at a time, committed immediately: meta + file are each
+    // written before moving on, so a crash mid-import keeps everything
+    // imported so far and the user can simply re-import the rest.
+    // Only one file buffer is alive at a time; nothing is accumulated.
     for (const file of files) {
       try {
         const buf = await file.arrayBuffer()
         const parsed = await parseByFormat(file, buf)
-        // For audio, duration/chapters live on the book record, not
-        // in metadata (enrichment must not overwrite them).
         const metadata = { ...parsed.metadata }
         if (parsed.extra.durationSec) metadata.durationSec = parsed.extra.durationSec
-        const book = {
-          id: uid(),
+        const id = uid()
+        const meta = {
+          id,
           fileName: file.name,
-          file: buf,
           format: parsed.format,
           metadata,
           audioChapters: parsed.extra.audioChapters || [],
@@ -178,16 +282,19 @@ export default function App() {
           addedAt: Date.now(),
           progress: null,
           fixedFields: [],
+          hasFile: true,
         }
-        await putBook(book)
+        await putBookMeta(meta)
+        await putBookFile(id, buf)
         imported++
-        setImportStatus(`Imported ${imported} of ${files.length}…`)
+        setImportStatus(`Imported ${imported} of ${files.length} — ${meta.metadata.title}`)
       } catch (e) {
         errors.push(`${file.name}: ${e.message}`)
       }
     }
     setImportErrors(errors)
     setImportStatus(`Done — imported ${imported} of ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
+    // Metadata only — never reload full file blobs after an import.
     await reload()
   }
 
@@ -211,6 +318,10 @@ export default function App() {
         appliedFields.push('cover')
       } else {
         updated.metadata[field] = value
+        // A supplied title is a real title, not a filename fallback:
+        // clear the filename-derived flag so the book can leave the
+        // Unsorted shelf once author/cover/series are also present.
+        if (field === 'title') updated.metadata.titleFromFilename = false
         if (!updated.fixedFields.includes(field)) updated.fixedFields.push(field)
         appliedFields.push(field)
       }
@@ -223,20 +334,28 @@ export default function App() {
         appliedAt: Date.now(),
       }]
     }
-    await putBook(updated)
+    await putBookMeta(updated)
     return updated
   }
 
-  async function runEnrichment() {
+  async function runEnrichment(scope = 'all') {
+    // Scoped by choice, never auto-run on import: 'unsorted' scans
+    // only the Unsorted shelf; 'all' keeps the old whole-library
+    // scan. Import itself never enriches — books arrive as-is.
+    const scopeBooks = scope === 'unsorted' ? books.filter(isUnsorted) : [...books]
+    if (!scopeBooks.length) {
+      setEnrichStatus(scope === 'unsorted' ? 'Unsorted shelf is empty — nothing to fix.' : 'No books to check.')
+      return
+    }
     setEnriching(true)
-    setEnrichStatus('Checking books for missing metadata…')
+    setEnrichStatus(`Checking ${scope === 'unsorted' ? 'Unsorted shelf' : 'all books'} for missing metadata…`)
     setProposals([])
     setAutoFixedSummary([])
     const review = []
     const autoSummary = []
     // Snapshot the library at run start: auto-applying mutates books,
     // so later lookups must not re-read the mutated state mid-run.
-    const snapshot = [...books]
+    const snapshot = scopeBooks
     for (let i = 0; i < snapshot.length; i++) {
       setEnrichStatus(`Checking ${i + 1} of ${snapshot.length}: ${snapshot[i].metadata.title}`)
       try {
@@ -305,17 +424,19 @@ export default function App() {
   // ---- Detail editing / linking ---------------------------------------
   async function saveDetailEdits(book, patch) {
     const updated = { ...book, metadata: { ...book.metadata, ...patch } }
-    await putBook(updated)
+    // A manually changed title is a real title, not a filename fallback.
+    if (patch.title && patch.title !== book.metadata.title) updated.metadata.titleFromFilename = false
+    await putBookMeta(updated)
     setSelected(updated)
     await reload()
   }
 
   async function linkBooks(epubBook, audioBook) {
     const epubUpdated = { ...epubBook, linkedAudioId: audioBook ? audioBook.id : null }
-    await putBook(epubUpdated)
+    await putBookMeta(epubUpdated)
     if (audioBook) {
       const audioUpdated = { ...audioBook, linkedEpubId: epubBook.id }
-      await putBook(audioUpdated)
+      await putBookMeta(audioUpdated)
     }
     setSelected(epubUpdated)
     await reload()
@@ -329,8 +450,17 @@ export default function App() {
 
   // Download a Cloud-only book and store it locally again. Metadata,
   // cover, series, progress and links are untouched — only `file` changes.
-  async function ensureLocal(book) {
-    if (book.file) return book
+  // Load a book's file blob on demand (one book, not the library).
+  // Returns the ArrayBuffer and keeps it in openFiles until the view
+  // leaves a viewer screen. Cloud-only books download from R2 first.
+  async function ensureLocalFile(book) {
+    if (openFiles[book.id]) return openFiles[book.id]
+    if (book.hasFile) {
+      const buf = await getBookFile(book.id)
+      if (buf) { setOpenFiles((prev) => ({ ...prev, [book.id]: buf })); return buf }
+      // hasFile said local, but the blob is gone: fall through to R2
+      // if there is a cloud copy, otherwise fail honestly.
+    }
     if (!book.r2Key) throw new Error('This book has no local file and no cloud copy.')
     const settings = requireR2()
     setCloudProgress(`Downloading ${book.metadata.title} from R2…`)
@@ -338,29 +468,41 @@ export default function App() {
       const buf = await downloadFromR2(settings, book.r2Key, (p) => {
         if (p.total) setCloudProgress(`Downloading ${book.metadata.title}… ${p.pct}%`)
       })
-      const updated = { ...book, file: buf }
-      await putBook(updated)
+      await putBookFile(book.id, buf)
+      const updated = { ...book, hasFile: true }
+      await putBookMeta(updated)
+      setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)))
       setSelected(updated)
-      await reload()
+      setOpenFiles((prev) => ({ ...prev, [book.id]: buf }))
       setCloudProgress('')
-      return updated
+      return buf
     } catch (e) {
       setCloudProgress('')
       throw e
     }
   }
 
+  // Back-compat wrapper used by the old detail/open paths: returns a
+  // book object with its file attached, for viewers only.
+  async function ensureLocal(book) {
+    const buf = await ensureLocalFile(book)
+    return { ...book, file: buf, hasFile: true }
+  }
+
   async function uploadBook(book, force = false) {
     const settings = requireR2()
     if (book.r2Key && !force) return book
-    if (!book.file) throw new Error(`"${book.metadata.title}" has no local file to upload.`)
+    if (!book.hasFile) throw new Error(`"${book.metadata.title}" has no local file to upload.`)
+    const fileBuf = await ensureLocalFile(book)
+    book = { ...book, file: fileBuf }
     const key = book.r2Key || r2KeyFor(book)
     setCloudProgress(`Uploading ${book.metadata.title}…`)
     const uploadedKey = await uploadToR2({ ...settings }, { ...book, r2Key: key }, (p) => {
       setCloudProgress(p.total ? `Uploading ${book.metadata.title}… ${p.pct}%` : `Uploading ${book.metadata.title}…`)
     })
-    const updated = { ...book, r2Key: uploadedKey }
-    await putBook(updated)
+    const { file: _f, ...updated } = { ...book, r2Key: uploadedKey }
+    await putBookMeta(updated)
+    setOpenFiles((prev) => { const next = { ...prev }; delete next[book.id]; return next })
     setCloudProgress('')
     return updated
   }
@@ -368,13 +510,15 @@ export default function App() {
   async function clearLocalFor(book) {
     const settings = requireR2()
     if (!book.r2Key) throw new Error('This book is not in R2 yet — upload it first, so clearing local does not lose it.')
-    if (!book.file) return book
+    if (!book.hasFile) return book
     // Verify the cloud copy actually exists before deleting the only
     // local copy. A failed verification aborts the clear, by design.
     const head = await headR2Object(settings, book.r2Key)
     if (!head.exists) throw new Error('R2 does not contain this book (HeadObject found nothing), so the local copy was NOT deleted.')
-    const updated = { ...book, file: null }
-    await putBook(updated)
+    await deleteBookFile(book.id)
+    const updated = { ...book, hasFile: false }
+    await putBookMeta(updated)
+    setOpenFiles((prev) => { const next = { ...prev }; delete next[book.id]; return next })
     return updated
   }
 
@@ -383,7 +527,7 @@ export default function App() {
     if (!book.r2Key) return book
     await deleteFromR2(settings, book.r2Key)
     const updated = { ...book, r2Key: null }
-    await putBook(updated)
+    await putBookMeta(updated)
     return updated
   }
 
@@ -407,57 +551,206 @@ export default function App() {
 
   // ---- Openers ---------------------------------------------------------
   async function openBook(book) {
-    // Cloud-only books are downloaded on demand, then opened exactly
-    // like a local book. If the download fails, fall back to the detail
-    // page (with cloud actions) instead of a broken viewer.
-    let local = book
-    if (!book.file && book.r2Key) {
-      try {
-        setCloudMsg(`Downloading ${book.metadata.title} from R2…`)
-        local = await ensureLocal(book)
-        setCloudMsg('')
-      } catch (e) {
-        setCloudMsg(`Could not download "${book.metadata.title}": ${friendlyR2Error(e)}`)
-        setSelected(book)
-        setView('detail')
-        return
-      }
-    }
-    setSelected(local)
-    if (local.format === 'pdf') { setView('pdf'); return }
-    if (local.format === 'comic') { setView('comic'); return }
-    if (local.format === 'audio') { setView('audio'); return }
+    // Detail page needs metadata only — no file blob is loaded here.
+    setSelected(book)
     setView('detail')
   }
 
   async function openReader(book) {
-    let local = book
-    try { local = await ensureLocal(book) } catch (e) { alert(`Could not download this book: ${friendlyR2Error(e)}`); return }
-    setSelected(local)
+    let buf
+    try { buf = await ensureLocalFile(book) } catch (e) { alert(`Could not open this book: ${e.message}`); return }
+    setSelected(book)
     setChapters([])
     setReaderHits([])
     setReaderSearch('')
-    const parsed = await parseChapters(local.file)
+    const parsed = await parseChapters(buf)
     setChapters(parsed)
     const saved = book.progress || loadProgressLocal(book.id)
     setChapterIndex(saved && saved.chapterIndex < parsed.length ? saved.chapterIndex : 0)
+    // Old progress records have only chapterIndex: they open at
+    // page 1 of that chapter (page defaults to 0 below).
+    const savedPage = saved && typeof saved.page === 'number' ? saved.page : 0
+    pageIndexRef.current = savedPage
+    setPageIndex(savedPage)
     setView('reader')
   }
 
-  async function goToChapter(book, index) {
-    setChapterIndex(index)
-    const progress = { chapterIndex: index, at: Date.now() }
+  async function saveReaderPage(book, chapter, page, count, totalChapters) {
+    const lastChapter = totalChapters ? chapter >= totalChapters - 1 : chapter >= (chapters.length - 1)
+    const finished = lastChapter && count > 0 && page >= count - 1
+      ? true
+      : (chapter < (totalChapters || chapters.length) - 1 ? false : !!book.progress?.finished)
+    const progress = {
+      ...(book.progress || {}),
+      chapterIndex: chapter,
+      page,
+      totalChapters: totalChapters || book.progress?.totalChapters || null,
+      finished,
+      at: Date.now(),
+    }
     saveProgressLocal(book.id, progress)
     const updated = { ...book, progress }
-    await putBook(updated)
+    await putBookMeta(updated)
     setSelected(updated)
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)))
   }
 
+  async function goToChapter(book, index, totalChapters, page = 0) {
+    setChapterIndex(index)
+    pageIndexRef.current = page
+    setPageIndex(page)
+    const progress = {
+      ...(book.progress || {}),
+      chapterIndex: index,
+      page,
+      totalChapters: totalChapters || book.progress?.totalChapters || null,
+      // Entering the last chapter does NOT finish the book — only
+      // reaching its last page does (see saveReaderPage). Preserve
+      // an existing finished flag so reopening a finished book does
+      // not unfinish it; moving to an earlier chapter clears it.
+      finished: totalChapters ? (index < totalChapters - 1 ? false : !!book.progress?.finished) : !!book.progress?.finished,
+      at: Date.now(),
+    }
+    saveProgressLocal(book.id, progress)
+    const updated = { ...book, progress }
+    await putBookMeta(updated)
+    setSelected(updated)
+    setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)))
+  }
+
+  // Page-turn navigation. Next on the last page of a chapter moves
+  // to the next chapter's first page; previous on the first page
+  // moves to the previous chapter's LAST page (via pagePendingRef,
+  // applied once that chapter has been repaginated).
+  function nextPage() {
+    if (pageIndexRef.current < pageCountRef.current - 1) {
+      const p = pageIndexRef.current + 1
+      pageIndexRef.current = p
+      setPageIndex(p)
+      if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
+    } else if (chapterIndex < chapters.length - 1) {
+      pagePendingRef.current = null
+      goToChapter(selected, chapterIndex + 1, chapters.length, 0)
+    } else if (selected) {
+      saveReaderPage(selected, chapterIndex, pageIndexRef.current, pageCountRef.current, chapters.length)
+    }
+  }
+
+  function prevPage() {
+    if (pageIndexRef.current > 0) {
+      const p = pageIndexRef.current - 1
+      pageIndexRef.current = p
+      setPageIndex(p)
+      if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
+    } else if (chapterIndex > 0) {
+      pagePendingRef.current = 'last'
+      goToChapter(selected, chapterIndex - 1, chapters.length, 0)
+    }
+  }
+
+  // Repaginate the current chapter after it renders, and whenever
+  // the font size or viewport changes. The chapter content is laid
+  // out in CSS columns (one column = one screen-sized page, see
+  // styles.css .reader-column-flow); page count comes from the
+  // measured scroll width, so it follows font size and viewport
+  // instead of guessing from character counts.
+  useEffect(() => {
+    if (view !== 'reader' || !chapters.length) return
+    let cancelled = false
+    const measure = () => {
+      if (cancelled) return
+      const el = pageRef.current
+      if (!el || !el.clientWidth) return
+      const GAP = 32 // must match column-gap in styles.css
+      const count = Math.max(1, Math.round((el.scrollWidth + GAP) / (el.clientWidth + GAP)))
+      const fontChanged = prevReaderFontRef.current !== fontSize
+      const chapterChanged = prevReaderChapterRef.current !== chapterIndex
+      prevReaderFontRef.current = fontSize
+      prevReaderChapterRef.current = chapterIndex
+      let p = pageIndexRef.current
+      if (pagePendingRef.current === 'last') p = count - 1
+      else if (typeof pagePendingRef.current === 'number') p = Math.min(count - 1, Math.max(0, Math.floor(pagePendingRef.current * count)))
+      else if (fontChanged && pageCountRef.current > 1) p = Math.min(count - 1, Math.max(0, Math.round((pageIndexRef.current / pageCountRef.current) * count)))
+      else p = Math.min(count - 1, Math.max(0, p))
+      pagePendingRef.current = null
+      const oldCount = pageCountRef.current
+      pageCountRef.current = count
+      setPageCount(count)
+      if (p !== pageIndexRef.current || count !== oldCount) {
+        pageIndexRef.current = p
+        setPageIndex(p)
+        if (selected && (p !== (selected.progress?.page || 0) || chapterChanged)) {
+          saveReaderPage(selected, chapterIndex, p, count, chapters.length)
+        }
+      }
+    }
+    const t1 = requestAnimationFrame(() => { const t2 = setTimeout(measure, 60); return t2 })
+    const onResize = () => measure()
+    window.addEventListener('resize', onResize)
+    return () => { cancelled = true; cancelAnimationFrame(t1); window.removeEventListener('resize', onResize) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view, chapterIndex, chapters, fontSize])
+
+  // Tap / swipe page-turn on the page area. Tap left third = previous,
+  // tap right third = next, middle = no-op (so text/links are not
+  // hijacked). Swipe left = next, swipe right = previous.
+  const readerTouch = useRef(null)
+  function onReaderTouchStart(e) {
+    const t = e.touches[0]
+    readerTouch.current = { x: t.clientX, y: t.clientY }
+  }
+  function onReaderTouchEnd(e) {
+    const s = readerTouch.current
+    readerTouch.current = null
+    if (!s) return
+    const t = e.changedTouches[0]
+    const dx = t.clientX - s.x
+    const dy = t.clientY - s.y
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+      if (dx < 0) nextPage()
+      else prevPage()
+    }
+  }
+  function onReaderClick(e) {
+    if (e.target && e.target.closest && e.target.closest('a,button')) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const frac = (e.clientX - rect.left) / Math.max(1, rect.width)
+    if (frac < 0.3) prevPage()
+    else if (frac > 0.7) nextPage()
+  }
+
+  // Pull-to-refresh: library + series + Unsorted views only, and only when the
+  // page is already scrolled to the top, so normal vertical scrolling
+  // is untouched. No preventDefault: the indicator follows the pull
+  // and a release past the threshold reloads metadata from IndexedDB.
+  function onPtrTouchStart(e) {
+    if (!['library', 'series', 'series-detail', 'unsorted'].includes(view)) return
+    if (window.scrollY > 0) return
+    ptrStartY.current = e.touches[0].clientY
+  }
+  function onPtrTouchMove(e) {
+    if (ptrStartY.current == null || ptrRefreshing) return
+    const dy = e.touches[0].clientY - ptrStartY.current
+    const d = dy > 0 ? Math.min(dy, 90) : 0
+    pullDistRef.current = d
+    setPullDist(d)
+  }
+  async function onPtrTouchEnd() {
+    const d = pullDistRef.current
+    ptrStartY.current = null
+    pullDistRef.current = 0
+    if (d >= 70 && !ptrRefreshing) {
+      setPtrRefreshing(true)
+      setPullDist(48)
+      try { await reload() } catch { /* reload failure just ends the indicator */ }
+      setPtrRefreshing(false)
+    }
+    setPullDist(0)
+  }
+
   async function openViewer(book, targetView) {
-    let local = book
-    try { local = await ensureLocal(book) } catch (e) { alert(`Could not download this book: ${friendlyR2Error(e)}`); return }
-    setSelected(local)
+    try { await ensureLocalFile(book) } catch (e) { alert(`Could not open this book: ${e.message}`); return }
+    setSelected(book)
     setView(targetView)
   }
 
@@ -465,14 +758,13 @@ export default function App() {
     const pair = linkedPairFor(book)
     if (!pair) { setView('readalong'); return }
     try {
-      const epubLocal = await ensureLocal(pair.epub)
-      const audioLocal = await ensureLocal(pair.audio)
-      // Refresh the pair in state so ReadAlongView gets local files.
+      await ensureLocalFile(pair.epub)
+      await ensureLocalFile(pair.audio)
       await reload()
-      setSelected(epubLocal.format === 'epub' ? epubLocal : audioLocal)
+      setSelected(pair.epub)
       setView('readalong')
     } catch (e) {
-      alert(`Could not download the read-along pair: ${friendlyR2Error(e)}`)
+      alert(`Could not download the read-along pair: ${e.message}`)
     }
   }
 
@@ -483,7 +775,11 @@ export default function App() {
     chapters.forEach((ch, i) => {
       const idx = ch.text.toLowerCase().indexOf(q)
       if (idx >= 0) {
-        hits.push({ chapter: i, title: ch.title, snippet: ch.text.slice(Math.max(0, idx - 60), idx + 120) })
+        // frac is a page estimate: columns fill in order, so the
+        // character position within the chapter approximates the
+        // page. The repaginate effect applies it once the target
+        // chapter has been laid out (see pagePendingRef).
+        hits.push({ chapter: i, title: ch.title, snippet: ch.text.slice(Math.max(0, idx - 60), idx + 120), frac: idx / Math.max(1, ch.text.length) })
       }
     })
     setReaderHits(hits)
@@ -492,7 +788,8 @@ export default function App() {
   async function exportBook(book) {
     setExporting(true)
     try {
-      const blob = await buildCorrectedEpub(book, book.metadata, book.metadata.coverDataUrl || '')
+      const buf = await ensureLocalFile(book)
+      const blob = await buildCorrectedEpub({ ...book, file: buf }, book.metadata, book.metadata.coverDataUrl || '')
       const safe = (book.metadata.title || 'book').replace(/[\\/:*?"<>|]+/g, '').slice(0, 80)
       downloadBlob(blob, `${safe} - fixed.epub`)
     } catch (e) {
@@ -505,8 +802,8 @@ export default function App() {
   // ---- Library view model ----------------------------------------------
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    let list = books
-    if (formatFilter !== 'all') list = list.filter((b) => b.format === formatFilter)
+    let list = books.filter(matchesFormatTab)
+    if (statusTab !== 'all') list = list.filter((b) => statusOf(b) === statusTab)
     if (q) {
       list = list.filter((b) => {
         const s = getSeries(b)
@@ -514,39 +811,61 @@ export default function App() {
       })
     }
     return sortBooks(list, sortMode)
-  }, [books, search, sortMode, formatFilter])
+  }, [books, search, sortMode, formatTab])
 
   const groups = useMemo(() => (sortMode === 'series' ? groupBySeries(filtered) : null), [filtered, sortMode])
+  const seriesBase = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    let list = books.filter(matchesFormatTab)
+    if (q) list = list.filter((b) => [b.metadata.title, b.metadata.author, getSeries(b).name, b.fileName].join(' ').toLowerCase().includes(q))
+    return list
+  }, [books, search, formatTab])
+  const seriesGroups = useMemo(() => groupBySeries(seriesBase), [seriesBase])
+  const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'cloud' ? 'Cloud' : view === 'fixes' ? 'Fix Review' : 'Library'
   const detail = selected && books.find((b) => b.id === selected.id)
   const detailPair = detail ? linkedPairFor(detail) : null
   const detailAuto = detail ? autoMatchFor(detail) : null
 
   return (
     <>
-      <header>
-        <div>
-          <h1>📖 ShelfSort</h1>
-          <div className="tagline">EPUB · PDF · Comics · Audiobooks — fix metadata & covers · sort by series</div>
+      <header className="topbar">
+        <h1>{headerTitle}</h1>
+        <div className="topbar-actions">
+          <button className="icon-btn" onClick={() => setSearchOpen(!searchOpen)} aria-label="Search">🔍</button>
+          {view === 'library' && (
+            <button className="icon-btn" onClick={() => setViewMode(viewMode === 'list' ? 'grid' : 'list')} aria-label="Toggle list/grid view">
+              {viewMode === 'list' ? '▦' : '☰'}
+            </button>
+          )}
+          <button className="icon-btn" onClick={() => setView('settings')} aria-label="Settings">⋮</button>
         </div>
-        <div className="toolbar" style={{ marginLeft: 'auto' }}>
-          <button className="theme-toggle" onClick={() => setAppTheme(appTheme === 'dark' ? 'light' : 'dark')} aria-label="Toggle light/dark mode">
-            {appTheme === 'dark' ? '☀️ Light mode' : '🌙 Dark mode'}
-          </button>
-          <button onClick={() => { setSelected(null); setView('library') }}>Library</button>
-          <button className="secondary" onClick={() => setView('cloud')}>☁️ Cloud / Settings</button>
-          <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
-            Auto-apply high-confidence fixes (only ask when unsure)
-          </label>
-          <button className="secondary" onClick={runEnrichment} disabled={enriching || !books.length}>
-            {enriching ? 'Checking…' : 'Find fixes'}
-          </button>
-        </div>
+        <nav className="topnav">
+          <button className={view === 'library' ? 'active' : ''} onClick={() => setView('library')}>Library</button>
+          <button className={view === 'series' || view === 'series-detail' ? 'active' : ''} onClick={() => setView('series')}>Series</button>
+          <button className={view === 'unsorted' ? 'active' : ''} onClick={() => setView('unsorted')}>Unsorted{books.filter(isUnsorted).length ? ` (${books.filter(isUnsorted).length})` : ''}</button>
+          <button className={view === 'settings' || view === 'cloud' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
+        </nav>
+        {searchOpen && (
+          <input className="top-search" type="search" placeholder="Search title, author, or series…" value={search} onChange={(e) => setSearch(e.target.value)} autoFocus />
+        )}
       </header>
 
-      <main>
+      <main onTouchStart={onPtrTouchStart} onTouchMove={onPtrTouchMove} onTouchEnd={onPtrTouchEnd}>
+        {['library', 'series', 'series-detail', 'unsorted'].includes(view) && (pullDist > 0 || ptrRefreshing) && (
+          <div className="ptr" style={{ height: ptrRefreshing ? 48 : pullDist }}>
+            {ptrRefreshing ? 'Refreshing…' : (pullDist >= 70 ? 'Release to refresh' : 'Pull to refresh')}
+          </div>
+        )}
         {view === 'library' && (
           <>
+            <div className="status-tabs" role="tablist">
+              {['all', 'new', 'started', 'finished'].map((t) => (
+                <button key={t} className={statusTab === t ? 'active' : ''} onClick={() => setStatusTab(t)}>
+                  {t === 'all' ? 'ALL' : t.toUpperCase()}
+                </button>
+              ))}
+            </div>
+
             <div
               className={`dropzone ${drag ? 'drag' : ''}`}
               onDragOver={(e) => { e.preventDefault(); setDrag(true) }}
@@ -554,7 +873,7 @@ export default function App() {
               onDrop={(e) => { e.preventDefault(); setDrag(false); importFiles(e.dataTransfer.files) }}
             >
               <p><strong>Drop files or a folder here</strong>, or use the buttons below.</p>
-              <p className="progress">EPUB, PDF, CBZ, CBR, M4B, MP3. CBR files are detected but cannot be opened in this build — see the note on a CBR book's detail page.</p>
+              <p className="progress">EPUB, PDF, CBZ, CBR, M4B, MP3 — imported one book at a time, each saved as soon as it is read, so an interrupted import keeps what finished.</p>
               <div className="toolbar" style={{ justifyContent: 'center' }}>
                 <button onClick={() => fileRef.current.click()}>Choose files</button>
                 <button className="secondary" onClick={() => folderRef.current.click()}>Choose a folder</button>
@@ -573,23 +892,14 @@ export default function App() {
             {cloudMsg && <p className="progress">{cloudMsg}</p>}
             {cloudProgress && <p className="progress">{cloudProgress}</p>}
             <div className="toolbar">
-              <input type="search" placeholder="Search title, author, or series…" value={search} onChange={(e) => setSearch(e.target.value)} />
-              <select value={formatFilter} onChange={(e) => setFormatFilter(e.target.value)} aria-label="Format filter">
-                <option value="all">All formats</option>
-                <option value="epub">EPUB</option>
-                <option value="pdf">PDF</option>
-                <option value="comic">Comic</option>
-                <option value="audio">Audiobook</option>
-              </select>
               <select value={sortMode} onChange={(e) => setSortMode(e.target.value)} aria-label="Sort">
                 <option value="series">Sort: Series</option>
                 <option value="author">Sort: Author</option>
                 <option value="title">Sort: Title</option>
+                <option value="date">Sort: Publication date</option>
                 <option value="recent">Sort: Recently added</option>
               </select>
-              <button className="secondary" onClick={async () => { if (confirm('Remove all books from ShelfSort? Files on your phone are not deleted.')) { await clearLibrary(); await reload() } }}>
-                Clear library
-              </button>
+              <span className="progress">{filtered.length} book{filtered.length === 1 ? '' : 's'}</span>
             </div>
 
             {!books.length ? (
@@ -602,28 +912,118 @@ export default function App() {
                   This is a personal app — there is no Play Store goal, and your books stay in this browser/app's storage.
                 </div>
               </div>
-            ) : sortMode === 'series' && groups ? (
-              groups.map((g) => (
-                <section className="series-group" key={g.key}>
-                  <h2 onClick={() => setExpanded((prev) => ({ ...prev, [g.key]: !prev[g.key] }))}>
-                    {expanded[g.key] === false ? '▶' : '▼'} {g.name} ({g.books.length})
-                  </h2>
-                  {g.gaps.length > 0 && (
-                    <p className="gap">⚠️ Missing in this series: {g.gaps.map((n) => `#${n}`).join(', ')} — you own {g.books.map((b) => getSeries(b).index).filter((n) => n !== null).join(', ')}.</p>
-                  )}
-                  {expanded[g.key] !== false && (
-                    <div className="grid">
-                      {g.books.map((b) => <BookCard key={b.id} book={b} onOpen={openBook} />)}
-                    </div>
-                  )}
-                </section>
-              ))
+            ) : !filtered.length ? (
+              <div className="card"><p>No books match this filter.</p></div>
+            ) : viewMode === 'grid' ? (
+              <div className="book-grid-wrap">
+                {filtered.map((b) => <BookGridCard key={b.id} book={b} onOpen={openBook} />)}
+              </div>
             ) : (
-              <div className="grid">
-                {filtered.map((b) => <BookCard key={b.id} book={b} onOpen={openBook} />)}
+              <div className="book-list">
+                {filtered.map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
               </div>
             )}
           </>
+        )}
+
+        {view === 'series' && (
+          <div className="series-list">
+            {!seriesGroups.filter((g) => g.key !== 'standalone').length && <div className="card"><p>No series yet — series come from a book's own metadata, its title, or a manual edit on its detail page.</p></div>}
+            {seriesGroups.filter((g) => g.key !== 'standalone').map((g) => (
+              <button key={g.key} className="series-row" onClick={() => { setSeriesDetail(g); setView('series-detail') }}>
+                <span className="series-tag">🏷</span>
+                <span className="series-name">{g.name}</span>
+                <span className="series-count">{g.books.length}</span>
+              </button>
+            ))}
+            {seriesGroups.filter((g) => g.key === 'standalone').map((g) => (
+              <button key={g.key} className="series-row" onClick={() => { setSeriesDetail(g); setView('series-detail') }}>
+                <span className="series-tag">🏷</span>
+                <span className="series-name">Standalone</span>
+                <span className="series-count">{g.books.length}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {view === 'series-detail' && seriesDetail && (
+          <div>
+            <button className="secondary" onClick={() => setView('series')}>← Back to Series</button>
+            <h2>{seriesDetail.name}</h2>
+            {seriesDetail.gaps.length > 0 && (
+              <p className="gap">⚠️ Missing in this series: {seriesDetail.gaps.map((n) => `#${n}`).join(', ')} — you own {seriesDetail.books.map((b) => getSeries(b).index).filter((n) => n !== null).join(', ')}.</p>
+            )}
+            <div className="book-list">
+              {seriesDetail.books.map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
+            </div>
+          </div>
+        )}
+
+        {view === 'unsorted' && (
+          <div>
+            <h2>🧺 Unsorted ({books.filter(isUnsorted).length})</h2>
+            <p className="progress">
+              Books that could not be sorted confidently: no series, and the author is missing, the cover is missing, or the title came from the filename because the file had no title metadata.
+              Standalone books with a real title, author and cover are not here. Import never fixes anything — fix these by choice, below.
+              A book leaves this shelf automatically once it has author + cover + series (or a real title + author + cover).
+            </p>
+            <div className="toolbar">
+              <button onClick={() => runEnrichment('unsorted')} disabled={enriching || !books.filter(isUnsorted).length}>
+                {enriching ? 'Checking…' : `Scan Unsorted shelf (${books.filter(isUnsorted).length})`}
+              </button>
+              <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
+            </div>
+            {enrichStatus && <p className="progress">{enrichStatus}</p>}
+            {!books.filter(isUnsorted).filter(matchesFormatTab).length ? (
+              <div className="card"><p>Unsorted shelf is empty{formatTab !== 'all' ? ' for this bottom tab — try All' : ''}. Every book in the library has a series, or a real title + author + cover.</p></div>
+            ) : (
+              <div className="book-list">
+                {books.filter(isUnsorted).filter(matchesFormatTab).map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === 'settings' && (
+          <div>
+            <div className="card">
+              <h2>Appearance</h2>
+              <button className="secondary" onClick={() => setAppTheme(appTheme === 'dark' ? 'light' : 'dark')}>
+                {appTheme === 'dark' ? '☀️ Switch to light mode' : '🌙 Switch to dark mode'}
+              </button>
+              <p className="progress">Library view: {viewMode === 'list' ? 'List' : 'Grid'} — toggle it from the top bar in the Library.</p>
+            </div>
+            <div className="card">
+              <h2>Metadata fixes</h2>
+              <p className="progress">Import first, fix second — by choice. Import never runs enrichment. Scan the Unsorted shelf (default) or the whole library.</p>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
+                Auto-apply high-confidence fixes (only ask when unsure)
+              </label>
+              <div className="toolbar">
+                <button onClick={() => runEnrichment('unsorted')} disabled={enriching || !books.filter(isUnsorted).length}>
+                  {enriching ? 'Checking…' : `Scan Unsorted shelf (${books.filter(isUnsorted).length})`}
+                </button>
+                <button className="secondary" onClick={() => runEnrichment('all')} disabled={enriching || !books.length}>
+                  {enriching ? 'Checking…' : 'Find fixes (all books)'}
+                </button>
+              </div>
+              {enrichStatus && <p className="progress">{enrichStatus}</p>}
+              <p className="progress">High confidence means an ISBN match to the same edition, or an exact title + author match with a single result. Everything uncertain goes to Fix Review.</p>
+            </div>
+            <div className="card">
+              <h2>Cloud shelf</h2>
+              <p className="progress">Keep the catalog on your phone and the big files in your private Cloudflare R2 bucket, or clear local copies after upload.</p>
+              <button className="secondary" onClick={() => setView('cloud')}>☁️ Cloud / Settings</button>
+            </div>
+            <div className="card">
+              <h2>Library</h2>
+              <p className="progress">{books.length} book{books.length === 1 ? '' : 's'} in the library. The library list loads metadata only — book files are loaded one at a time when you open a book, so even 300 EPUBs stay stable.</p>
+              <button className="secondary" onClick={async () => { if (confirm('Remove all books from ShelfSort? Files on your phone are not deleted.')) { await clearLibrary(); await reload() } }}>
+                Clear library
+              </button>
+            </div>
+          </div>
         )}
 
         {view === 'detail' && detail && (
@@ -649,12 +1049,21 @@ export default function App() {
                 )}
                 {cloudProgress && <p className="progress">{cloudProgress}</p>}
                 {cloudMsg && <p className="progress">{cloudMsg}</p>}
+                <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6, margin: '8px 0' }}>
+                  <input type="checkbox" checked={!!detail.progress?.finished} onChange={async (e) => {
+                    const progress = { ...(detail.progress || {}), finished: e.target.checked, at: Date.now() }
+                    const updated = { ...detail, progress }
+                    await putBookMeta(updated); setSelected(updated); await reload()
+                  }} />
+                  Finished
+                </label>
+                <p className="progress">Status: {statusOf(detail)} · {detail.hasFile ? '📱 Local' : 'No local file'}{detail.r2Key ? ' · ☁️ In R2' : ''}</p>
                 <div className="toolbar">
                   {!r2Settings && <button className="secondary" onClick={() => setView('cloud')}>Set up Cloud / R2</button>}
-                  {r2Settings && detail.file && !detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail); setSelected(u); await reload(); setCloudMsg(`Uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Upload to R2</button>}
-                  {r2Settings && detail.file && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail, true); setSelected(u); await reload(); setCloudMsg(`Re-uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Re-upload to R2</button>}
-                  {r2Settings && detail.file && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await clearLocalFor(detail); setSelected(u); await reload(); setCloudMsg(`Local copy cleared for "${detail.metadata.title}". Metadata, cover, series and progress are kept; open it anytime to download it again.`) } catch (e) { setCloudMsg(`Clear local failed: ${friendlyR2Error(e)}`) } }}>🧹 Clear local (keep in R2)</button>}
-                  {r2Settings && !detail.file && detail.r2Key && <button onClick={() => openBook(detail)}>☁️ Download from R2 & open</button>}
+                  {r2Settings && detail.hasFile && !detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail); setSelected(u); await reload(); setCloudMsg(`Uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Upload to R2</button>}
+                  {r2Settings && detail.hasFile && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail, true); setSelected(u); await reload(); setCloudMsg(`Re-uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Re-upload to R2</button>}
+                  {r2Settings && detail.hasFile && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await clearLocalFor(detail); setSelected(u); await reload(); setCloudMsg(`Local copy cleared for "${detail.metadata.title}". Metadata, cover, series and progress are kept; open it anytime to download it again.`) } catch (e) { setCloudMsg(`Clear local failed: ${friendlyR2Error(e)}`) } }}>🧹 Clear local (keep in R2)</button>}
+                  {r2Settings && !detail.hasFile && detail.r2Key && <button onClick={() => openBook(detail)}>☁️ Download from R2 & open</button>}
                   {r2Settings && detail.r2Key && <button className="secondary" onClick={async () => { if (!confirm(`Delete "${detail.metadata.title}" from R2? The local copy (if any) is kept, but the cloud copy will be gone.`)) return; try { const u = await deleteFromCloudFor(detail); setSelected(u); await reload(); setCloudMsg(`Deleted "${detail.metadata.title}" from R2.`) } catch (e) { setCloudMsg(`Delete from cloud failed: ${friendlyR2Error(e)}`) } }}>🗑️ Delete from R2</button>}
                 </div>
                 {detail.cbrUnsupported && (
@@ -752,7 +1161,7 @@ export default function App() {
             onUploadAll={async () => {
               if (!r2Settings) { setCloudMsg('Enter and save your R2 settings first.'); return }
               setCloudBusy(true)
-              const pending = books.filter((b) => b.file && !b.r2Key)
+              const pending = books.filter((b) => b.hasFile && !b.r2Key)
               let ok = 0; const errs = []
               for (let i = 0; i < pending.length; i++) {
                 setCloudMsg(`Uploading ${i + 1} of ${pending.length}: ${pending[i].metadata.title}`)
@@ -766,7 +1175,7 @@ export default function App() {
               if (!confirm('Clear local copies for every book that is safely in R2? Metadata, covers, series and progress stay in the library; files can be downloaded again on demand.')) return
               setCloudBusy(true)
               let ok = 0; const errs = []
-              for (const b of books.filter((x) => x.file && x.r2Key)) {
+              for (const b of books.filter((x) => x.hasFile && x.r2Key)) {
                 try { await clearLocalFor(b); ok++ } catch (e) { errs.push(`${b.metadata.title}: ${friendlyR2Error(e)}`) }
               }
               await reload()
@@ -793,9 +1202,9 @@ export default function App() {
               const book = {
                 id: id || uid(),
                 fileName: obj.key.split('/').pop(),
-                file: null,
+                hasFile: false,
                 format,
-                metadata: { title: titleFromR2Key(obj.key), author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 },
+                metadata: { title: titleFromR2Key(obj.key), titleFromFilename: true, author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 },
                 audioChapters: [],
                 cbrUnsupported: ext === 'cbr',
                 addedAt: Date.now(),
@@ -803,12 +1212,12 @@ export default function App() {
                 fixedFields: [],
                 r2Key: obj.key,
               }
-              await putBook(book)
+              await putBookMeta(book)
               await reload()
               setSyncMsg(`Added "${book.metadata.title}" as Cloud only. Open it to download it, then its real metadata/cover will be parsed on import — or download it and re-import locally for full metadata.`)
             }}
             onDownloadBook={async (book) => {
-              try { await ensureLocal(book); setCloudMsg(`Downloaded "${book.metadata.title}" — it is now local again.`) } catch (e) { setCloudMsg(`Download failed: ${friendlyR2Error(e)}`) }
+              try { await ensureLocal(book); setOpenFiles((prev) => { const next = { ...prev }; delete next[book.id]; return next }); setCloudMsg(`Downloaded "${book.metadata.title}" — it is now local again.`) } catch (e) { setCloudMsg(`Download failed: ${friendlyR2Error(e)}`) }
             }}
             onUploadBook={async (book) => {
               try { await uploadBook(book); await reload(); setCloudMsg(`Uploaded "${book.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) }
@@ -871,9 +1280,9 @@ export default function App() {
             <button className="secondary" onClick={() => setView('detail')}>← Back to book</button>
             <h2>{selected.metadata.title}</h2>
             <div className="toolbar">
-              <button className="secondary" disabled={chapterIndex <= 0} onClick={() => goToChapter(selected, chapterIndex - 1)}>← Previous chapter</button>
-              <button className="secondary" disabled={chapterIndex >= chapters.length - 1} onClick={() => goToChapter(selected, chapterIndex + 1)}>Next chapter →</button>
-              <select value={chapterIndex} onChange={(e) => goToChapter(selected, Number(e.target.value))}>
+              <button className="secondary" disabled={chapterIndex <= 0} onClick={() => goToChapter(selected, chapterIndex - 1, chapters.length)}>← Previous chapter</button>
+              <button className="secondary" disabled={chapterIndex >= chapters.length - 1} onClick={() => goToChapter(selected, chapterIndex + 1, chapters.length)}>Next chapter →</button>
+              <select value={chapterIndex} onChange={(e) => goToChapter(selected, Number(e.target.value), chapters.length)}>
                 {chapters.map((ch, i) => <option key={i} value={i}>{ch.title || `Chapter ${i + 1}`}</option>)}
               </select>
               <label>Font <input type="range" min="14" max="26" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))} /></label>
@@ -891,22 +1300,49 @@ export default function App() {
             {readerHits.length > 0 && (
               <div className="card">
                 {readerHits.map((h, i) => (
-                  <div key={i}><button className="secondary" onClick={() => goToChapter(selected, h.chapter)}>{h.title}</button> …{h.snippet}…</div>
+                  <div key={i}><button className="secondary" onClick={() => { pagePendingRef.current = h.frac; goToChapter(selected, h.chapter, chapters.length, 0); setReaderHits([]) }}>{h.title}</button> …{h.snippet}…</div>
                 ))}
               </div>
             )}
             {!chapters.length ? <p className="progress">Loading chapters…</p> : (
-              <article className="chapter" style={{ ['--reader-size']: `${fontSize}px` }}
-                dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
+              <>
+                <div className="reader-pages" onTouchStart={onReaderTouchStart} onTouchEnd={onReaderTouchEnd} onClick={onReaderClick}>
+                  <div ref={pageRef} className="reader-column-flow chapter" style={{ ['--reader-size']: `${fontSize}px`, transform: `translateX(${-pageIndex * 100}%)` }}
+                    dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
+                </div>
+                <div className="toolbar reader-pagebar">
+                  <button className="secondary" onClick={prevPage}>← Previous page</button>
+                  <span className="progress">Page {pageIndex + 1} of {pageCount} · Chapter {chapterIndex + 1} of {chapters.length}</span>
+                  <button className="secondary" onClick={nextPage}>Next page →</button>
+                </div>
+                <p className="progress">Tap the left or right side of the page, or swipe, to turn pages. The last page of a chapter goes to the next chapter.</p>
+              </>
             )}
           </div>
         )}
 
-        {view === 'pdf' && selected && <PdfViewer book={selected} onBack={() => setView('detail')} onSave={async (book, progress) => { const u = { ...book, progress }; await putBook(u); setSelected(u); await reload() }} />}
-        {view === 'comic' && selected && <ComicViewer book={selected} onBack={() => setView('detail')} onSave={async (book, progress) => { const u = { ...book, progress }; await putBook(u); setSelected(u); await reload() }} />}
-        {view === 'audio' && selected && <AudioPlayer book={selected} onBack={() => setView('detail')} onSave={async (book, progress) => { const u = { ...book, progress }; await putBook(u); setSelected(u); }} readAlongPair={linkedPairFor(selected)} onReadAlong={() => openReadAlong(selected)} />}
-        {view === 'readalong' && selected && <ReadAlongView epubBook={detailPair ? detailPair.epub : selected} audioBook={detailPair ? detailPair.audio : null} books={books} onBack={() => setView('detail')} onSave={async (book, progress) => { const u = { ...book, progress }; await putBook(u); }} />}
+        {view === 'pdf' && selected && <PdfViewer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); await reload() }} />}
+        {view === 'comic' && selected && <ComicViewer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); await reload() }} />}
+        {view === 'audio' && selected && <AudioPlayer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); }} readAlongPair={linkedPairFor(selected)} onReadAlong={() => openReadAlong(selected)} />}
+        {view === 'readalong' && selected && <ReadAlongView epubBook={detailPair ? withFile(detailPair.epub) : withFile(selected)} audioBook={detailPair ? withFile(detailPair.audio) : null} books={books} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); }} />}
       </main>
+
+      {['library', 'series', 'series-detail', 'unsorted'].includes(view) && (
+        <nav className="bottom-tabs" aria-label="Format">
+          {[
+            { key: 'all', label: 'All', icon: '📚', count: books.length },
+            { key: 'books', label: 'Books', icon: '📖', count: books.filter((b) => b.format === 'epub' || b.format === 'pdf').length },
+            { key: 'comics', label: 'Comics', icon: '🖼️', count: books.filter((b) => b.format === 'comic').length },
+            { key: 'audiobooks', label: 'Audiobooks', icon: '🎧', count: books.filter((b) => b.format === 'audio').length },
+          ].map((t) => (
+            <button key={t.key} className={formatTab === t.key ? 'active' : ''} onClick={() => setFormatTab(t.key)}>
+              <span className="bt-icon">{t.icon}</span>
+              <span>{t.label}</span>
+              <span className="bt-count">{t.count}</span>
+            </button>
+          ))}
+        </nav>
+      )}
     </>
   )
 }
@@ -1043,9 +1479,9 @@ function CloudView(props) {
           <div key={b.id} className="chapter-row">
             <span>{b.metadata.title} — {cloudStatusLabel(b)}</span>
             <span className="toolbar">
-              {b.file && !b.r2Key && <button className="secondary" onClick={() => onUploadBook(b)}>Upload</button>}
-              {b.file && b.r2Key && <button className="secondary" onClick={() => onClearLocalBook(b)}>Clear local</button>}
-              {!b.file && b.r2Key && <button className="secondary" onClick={() => onDownloadBook(b)}>Download</button>}
+              {b.hasFile && !b.r2Key && <button className="secondary" onClick={() => onUploadBook(b)}>Upload</button>}
+              {b.hasFile && b.r2Key && <button className="secondary" onClick={() => onClearLocalBook(b)}>Clear local</button>}
+              {!b.hasFile && b.r2Key && <button className="secondary" onClick={() => onDownloadBook(b)}>Download</button>}
             </span>
           </div>
         ))}
@@ -1066,6 +1502,7 @@ function PdfViewer({ book, onBack, onSave }) {
 
   useEffect(() => {
     let cancelled = false
+    if (!book.file) return () => { cancelled = true }
     loadPdf(book.file).then((doc) => {
       if (cancelled) return
       docRef.current = doc
@@ -1075,7 +1512,7 @@ function PdfViewer({ book, onBack, onSave }) {
       setStatus('')
     }).catch((e) => setStatus(`Could not open PDF: ${e.message}`))
     return () => { cancelled = true }
-  }, [book.id])
+  }, [book.id, book.file])
 
   useEffect(() => {
     if (!docRef.current || !canvasRef.current || !total) return
@@ -1121,6 +1558,7 @@ function ComicViewer({ book, onBack, onSave }) {
 
   useEffect(() => {
     let cancelled = false
+    if (!book.file) { setStatus('Loading comic…'); return () => { cancelled = true } }
     ;(async () => {
       try {
         const names = book.metadata.pageNames || []
@@ -1140,7 +1578,7 @@ function ComicViewer({ book, onBack, onSave }) {
       }
     })()
     return () => { cancelled = true; urlsRef.current.forEach((u) => URL.revokeObjectURL(u.url)); urlsRef.current = [] }
-  }, [book.id])
+  }, [book.id, book.file])
 
   function goTo(i) {
     if (i < 0 || i >= pages.length) return
@@ -1190,7 +1628,6 @@ function ComicViewer({ book, onBack, onSave }) {
 }
 
 function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
-  const audioRef = useRef(null)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(book.metadata.durationSec || 0)
   const [playing, setPlaying] = useState(false)
@@ -1198,57 +1635,104 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
   const [sleepMin, setSleepMin] = useState(0)
   const [sleepLeft, setSleepLeft] = useState(0)
   const [bookmarks, setBookmarks] = useState((book.progress && book.progress.bookmarks) || [])
-  const [url, setUrl] = useState('')
   const [chapterIndex, setChapterIndex] = useState(0)
+  const [playerMode, setPlayerMode] = useState('')
+  const [playerError, setPlayerError] = useState('')
+  const [loading, setLoading] = useState(true)
   const sleepTimerRef = useRef(null)
   const lastSavedRef = useRef(0)
-
-  useEffect(() => {
-    const type = book.fileName && /\.mp3$/i.test(book.fileName) ? 'audio/mpeg' : 'audio/mp4'
-    const u = URL.createObjectURL(new Blob([book.file], { type }))
-    setUrl(u)
-    const saved = book.progress
-    if (saved && saved.positionSec) setCurrent(saved.positionSec)
-    return () => URL.revokeObjectURL(u)
-  }, [book.id])
-
-  useEffect(() => {
-    const el = audioRef.current
-    if (!el || !url) return
-    el.currentTime = current
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url])
-
-  useEffect(() => () => { if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current) }, [])
+  const currentRef = useRef(0)
+  const chapterRef = useRef(0)
+  const bookmarksRef = useRef(bookmarks)
+  const ctrlRef = useRef(null)
+  const bookRef = useRef(book)
+  bookRef.current = book
+  bookmarksRef.current = bookmarks
 
   function saveProgress(pos, chap) {
-    const progress = { positionSec: pos, chapterIndex: chap, bookmarks, at: Date.now() }
-    onSave(book, progress)
+    const progress = { positionSec: pos, chapterIndex: chap, bookmarks: bookmarksRef.current, at: Date.now() }
+    onSave(bookRef.current, progress)
   }
+  const saveProgressRef = useRef(saveProgress)
+  saveProgressRef.current = saveProgress
 
-  function onTimeUpdate() {
-    const el = audioRef.current
-    if (!el) return
-    setCurrent(el.currentTime)
-    if (el.duration && Number.isFinite(el.duration)) setDuration(el.duration)
-    const chapters = book.audioChapters || []
-    if (chapters.length) {
-      let idx = 0
-      for (let i = 0; i < chapters.length; i++) if (chapters[i].start <= el.currentTime + 0.5) idx = i
-      if (idx !== chapterIndex) setChapterIndex(idx)
+  // Create the controller once per book. Native on Android (Playlist /
+  // ExoPlayer + MediaSession, background + notification controls),
+  // HTML <audio> on web or if native setup fails. The controller is
+  // NOT paused on unmount: that is the point of a native player —
+  // backing out to the library/detail keeps playing in the background.
+  // The final position is saved on unmount via the refs above.
+  useEffect(() => {
+    let cancelled = false
+    let ctrl = null
+    setLoading(true)
+    setPlayerError('')
+    const saved = book.progress
+    const startPos = saved && saved.positionSec ? saved.positionSec : 0
+    currentRef.current = startPos
+    lastSavedRef.current = startPos
+    setCurrent(startPos)
+    createAudioController({
+      book,
+      fileBuf: book.file,
+      startPosition: startPos,
+      pauseOnDestroy: false,
+      cbs: {
+        onPosition: (pos, dur) => {
+          if (cancelled) return
+          currentRef.current = pos
+          setCurrent(pos)
+          if (dur > 0) setDuration(dur)
+          const chapters = book.audioChapters || []
+          if (chapters.length) {
+            let idx = 0
+            for (let i = 0; i < chapters.length; i++) if (chapters[i].start <= pos + 0.5) idx = i
+            if (idx !== chapterRef.current) { chapterRef.current = idx; setChapterIndex(idx) }
+          }
+          if (Math.abs(pos - lastSavedRef.current) > 5) {
+            lastSavedRef.current = pos
+            saveProgressRef.current(pos, chapterRef.current)
+          }
+        },
+        onPlaying: (p) => { if (!cancelled) setPlaying(p) },
+        onEnded: () => { if (!cancelled) setPlaying(false) },
+        onError: () => { if (!cancelled) setPlayerError('Playback reported an error. Try pressing play again, or re-import the file.') },
+      },
+    }).then((c) => {
+      if (cancelled) { c.destroy(); return }
+      ctrl = c
+      ctrlRef.current = c
+      setPlayerMode(c.mode)
+      if (c.fallbackFromNative) setPlayerError('Native player was unavailable, so this is playing with the in-app player (no background playback).')
+      setLoading(false)
+    }).catch(() => {
+      if (!cancelled) { setPlayerError('Could not start playback for this file.'); setLoading(false) }
+    })
+    return () => {
+      cancelled = true
+      // Save wherever playback had reached, even if it kept playing
+      // in the background after this screen unmounted.
+      if (currentRef.current > 0) saveProgressRef.current(currentRef.current, chapterRef.current)
+      if (ctrl) ctrl.destroy()
+      else if (ctrlRef.current) ctrlRef.current.destroy()
+      ctrlRef.current = null
+      if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current)
     }
-    if (Math.abs(el.currentTime - lastSavedRef.current) > 5) {
-      lastSavedRef.current = el.currentTime
-      saveProgress(el.currentTime, chapterIndex)
-    }
-  }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [book.id])
 
   function seekTo(sec) {
-    const el = audioRef.current
-    if (!el) return
-    el.currentTime = Math.max(0, Math.min(duration || sec, sec))
-    setCurrent(el.currentTime)
-    saveProgress(el.currentTime, chapterIndex)
+    const target = Math.max(0, Math.min(duration || sec, sec))
+    currentRef.current = target
+    setCurrent(target)
+    ctrlRef.current && ctrlRef.current.seekTo(target)
+    saveProgress(target, chapterRef.current)
+  }
+
+  function togglePlay() {
+    if (!ctrlRef.current) return
+    if (playing) ctrlRef.current.pause()
+    else ctrlRef.current.play()
   }
 
   function setSleep(min) {
@@ -1256,8 +1740,11 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
     if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current)
     if (!min) { setSleepLeft(0); return }
     setSleepLeft(min * 60)
+    // Sleep timer lives in this screen only: if the user leaves the
+    // player, the timer is cleared on unmount (native background
+    // playback itself keeps going, but no timer is left running).
     sleepTimerRef.current = setTimeout(() => {
-      if (audioRef.current) audioRef.current.pause()
+      if (ctrlRef.current) ctrlRef.current.pause()
       setPlaying(false)
       setSleepLeft(0)
       setSleepMin(0)
@@ -1265,35 +1752,33 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
   }
 
   function addBookmark() {
-    const next = [...bookmarks, { time: Math.floor(current), label: `Bookmark ${formatTime(current)}` }]
+    const next = [...bookmarks, { time: Math.floor(currentRef.current), label: `Bookmark ${formatTime(currentRef.current)}` }]
     setBookmarks(next)
-    onSave(book, { positionSec: current, chapterIndex, bookmarks: next, at: Date.now() })
+    bookmarksRef.current = next
+    onSave(book, { positionSec: currentRef.current, chapterIndex: chapterRef.current, bookmarks: next, at: Date.now() })
   }
 
   const chapters = book.audioChapters || []
   return (
     <div className="card viewer">
-      <button className="secondary" onClick={() => { saveProgress(current, chapterIndex); onBack() }}>← Back to book</button>
+      <button className="secondary" onClick={() => { saveProgress(currentRef.current, chapterRef.current); onBack() }}>← Back to book</button>
       <h2>🎧 {book.metadata.title}</h2>
       <p>{book.metadata.author || 'Unknown author'}</p>
-      <audio ref={audioRef} src={url} preload="metadata"
-        onTimeUpdate={onTimeUpdate}
-        onLoadedMetadata={(e) => { if (Number.isFinite(e.target.duration)) setDuration(e.target.duration) }}
-        onPlay={() => setPlaying(true)}
-        onPause={() => { setPlaying(false); saveProgress(audioRef.current ? audioRef.current.currentTime : current, chapterIndex) }}
-        onEnded={() => setPlaying(false)}
-      />
+      {playerMode === 'native' && <p className="progress">Native player — keeps playing in the background, with lock-screen / notification controls.</p>}
+      {playerMode === 'html' && <p className="progress">In-app player (web fallback).</p>}
+      {loading && <p className="progress">Loading audio… (large M4Bs are copied to the app cache on first open, then reused.)</p>}
+      {playerError && <p className="error">{playerError}</p>}
       <div className="audio-controls">
         <input type="range" min="0" max={duration || 0} step="1" value={Math.min(current, duration || 0)} onChange={(e) => seekTo(Number(e.target.value))} />
         <div className="toolbar">
           <span>{formatTime(current)} / {formatTime(duration)}</span>
           <button className="secondary" onClick={() => seekTo(current - 15)}>−15s</button>
           <button className="secondary" onClick={() => seekTo(current - 30)}>−30s</button>
-          <button onClick={() => { const el = audioRef.current; if (!el) return; if (el.paused) el.play(); else el.pause() }}>{playing ? '⏸ Pause' : '▶ Play'}</button>
+          <button onClick={togglePlay} disabled={loading}>{playing ? '⏸ Pause' : '▶ Play'}</button>
           <button className="secondary" onClick={() => seekTo(current + 15)}>+15s</button>
           <button className="secondary" onClick={() => seekTo(current + 30)}>+30s</button>
           <label>Speed
-            <select value={speed} onChange={(e) => { const s = Number(e.target.value); setSpeed(s); if (audioRef.current) audioRef.current.playbackRate = s }}>
+            <select value={speed} onChange={(e) => { const s = Number(e.target.value); setSpeed(s); if (ctrlRef.current) ctrlRef.current.setRate(s) }}>
               {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((s) => <option key={s} value={s}>{s}×</option>)}
             </select>
           </label>
@@ -1338,69 +1823,97 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
 }
 
 function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
-  const audioRef = useRef(null)
   const [epubChapters, setEpubChapters] = useState([])
   const [epubIndex, setEpubIndex] = useState(0)
   const [current, setCurrent] = useState(0)
   const [playing, setPlaying] = useState(false)
-  const [url, setUrl] = useState('')
   const [fontSize, setFontSize] = useState(18)
+  const [playerMode, setPlayerMode] = useState('')
+  const [playerError, setPlayerError] = useState('')
   const syncingFromAudioRef = useRef(false)
+  const ctrlRef = useRef(null)
+  const epubIndexRef = useRef(0)
 
   const audioChapters = (audioBook && audioBook.audioChapters) || []
   const mapping = useMemo(() => mapChapters(epubChapters, audioChapters), [epubChapters, audioChapters])
+  const mappingRef = useRef(mapping)
+  mappingRef.current = mapping
 
   useEffect(() => {
-    if (!epubBook) return
+    if (!epubBook || !epubBook.file) return
     parseChapters(epubBook.file).then((ch) => {
       setEpubChapters(ch)
       const saved = epubBook.progress
-      if (saved && saved.chapterIndex < ch.length) setEpubIndex(saved.chapterIndex)
+      if (saved && saved.chapterIndex < ch.length) { setEpubIndex(saved.chapterIndex); epubIndexRef.current = saved.chapterIndex }
     }).catch(() => {})
-  }, [epubBook && epubBook.id])
+  }, [epubBook && epubBook.id, epubBook && epubBook.file])
 
+  // Read-along uses the SAME native controller as the standalone
+  // player, so position events drive the EPUB chapter sync. Native
+  // position events are throttled / suppressed while backgrounded —
+  // read-along is a foreground activity, so that is fine here.
+  // Unlike the standalone player, leaving read-along DOES pause:
+  // the EPUB view is gone, so continuing audio alone would be a
+  // surprise (pauseOnDestroy: true in nativeAudio.js).
   useEffect(() => {
-    if (!audioBook) return
-    const type = audioBook.fileName && /\.mp3$/i.test(audioBook.fileName) ? 'audio/mpeg' : 'audio/mp4'
-    const u = URL.createObjectURL(new Blob([audioBook.file], { type }))
-    setUrl(u)
+    if (!audioBook || !audioBook.file) return
+    let cancelled = false
+    let ctrl = null
     const saved = audioBook.progress
-    if (saved && saved.positionSec) setCurrent(saved.positionSec)
-    return () => URL.revokeObjectURL(u)
-  }, [audioBook && audioBook.id])
-
-  useEffect(() => {
-    const el = audioRef.current
-    if (el && url && current) el.currentTime = current
+    const startPos = saved && saved.positionSec ? saved.positionSec : 0
+    setCurrent(startPos)
+    createAudioController({
+      book: audioBook,
+      fileBuf: audioBook.file,
+      startPosition: startPos,
+      pauseOnDestroy: true,
+      cbs: {
+        onPosition: (pos) => {
+          if (cancelled) return
+          setCurrent(pos)
+          const chs = audioChapters
+          if (!chs.length || !epubChapters.length) return
+          const aIdx = audioChapterAtTime(chs, pos)
+          let eIdx = mappingRef.current.indexOf(aIdx)
+          if (eIdx < 0) eIdx = Math.min(aIdx, epubChapters.length - 1)
+          if (eIdx !== epubIndexRef.current && !syncingFromAudioRef.current) {
+            syncingFromAudioRef.current = true
+            epubIndexRef.current = eIdx
+            setEpubIndex(eIdx)
+            if (epubBook) onSave(epubBook, { chapterIndex: eIdx, at: Date.now() })
+            setTimeout(() => { syncingFromAudioRef.current = false }, 200)
+          }
+        },
+        onPlaying: (p) => { if (!cancelled) setPlaying(p) },
+        onEnded: () => { if (!cancelled) setPlaying(false) },
+        onError: () => { if (!cancelled) setPlayerError('Playback reported an error.') },
+      },
+    }).then((c) => {
+      if (cancelled) { c.destroy(); return }
+      ctrl = c
+      ctrlRef.current = c
+      setPlayerMode(c.mode)
+      if (c.fallbackFromNative) setPlayerError('Native player was unavailable, so read-along is using the in-app player.')
+    }).catch(() => { if (!cancelled) setPlayerError('Could not start read-along audio.') })
+    return () => {
+      cancelled = true
+      if (ctrl) ctrl.destroy()
+      else if (ctrlRef.current) ctrlRef.current.destroy()
+      ctrlRef.current = null
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url])
+  }, [audioBook && audioBook.id, audioBook && audioBook.file])
 
   function goToEpubChapter(index, seekAudio = true) {
+    epubIndexRef.current = index
     setEpubIndex(index)
     if (epubBook) onSave(epubBook, { chapterIndex: index, at: Date.now() })
     if (seekAudio && audioBook && audioChapters.length) {
       const audioIdx = mapping[index]
-      if (audioIdx >= 0 && audioRef.current) {
-        audioRef.current.currentTime = audioChapters[audioIdx].start
+      if (audioIdx >= 0 && ctrlRef.current) {
+        ctrlRef.current.seekTo(audioChapters[audioIdx].start)
         setCurrent(audioChapters[audioIdx].start)
       }
-    }
-  }
-
-  function onAudioTime() {
-    const el = audioRef.current
-    if (!el) return
-    setCurrent(el.currentTime)
-    if (!audioChapters.length || !epubChapters.length) return
-    const aIdx = audioChapterAtTime(audioChapters, el.currentTime)
-    // Reverse mapping: first EPUB chapter mapped to this audio chapter.
-    let eIdx = mapping.indexOf(aIdx)
-    if (eIdx < 0) eIdx = Math.min(aIdx, epubChapters.length - 1)
-    if (eIdx !== epubIndex && !syncingFromAudioRef.current) {
-      syncingFromAudioRef.current = true
-      setEpubIndex(eIdx)
-      if (epubBook) onSave(epubBook, { chapterIndex: eIdx, at: Date.now() })
-      setTimeout(() => { syncingFromAudioRef.current = false }, 200)
     }
   }
 
@@ -1422,12 +1935,12 @@ function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
         <strong>Chapter-level sync, not word-by-word.</strong> When the audio chapter changes, the EPUB advances to the matching chapter (by title, otherwise by order).
         When you change EPUB chapter, the audio seeks to that chapter's start. Ordinary EPUB + M4B pairs do not contain word timing data, so word highlighting is not claimed here.
       </p>
-      <audio ref={audioRef} src={url} preload="metadata" controls
-        onTimeUpdate={onAudioTime}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-      />
-      <p className="progress">{formatTime(current)} · Audio chapter: {audioChapters.length ? (audioChapters[audioChapterAtTime(audioChapters, current)]?.title || '—') : 'No embedded chapters — sync follows EPUB chapter order only when you change chapters'} · EPUB chapter {epubChapters.length ? epubIndex + 1 : '…'} of {epubChapters.length}</p>
+      {playerMode === 'native' && <p className="progress">Native player — audio keeps playing if you switch apps; leaving this screen pauses it.</p>}
+      {playerError && <p className="error">{playerError}</p>}
+      <div className="toolbar">
+        <button onClick={() => { if (!ctrlRef.current) return; if (playing) ctrlRef.current.pause(); else ctrlRef.current.play() }}>{playing ? '⏸ Pause' : '▶ Play'}</button>
+        <span>{formatTime(current)} · Audio chapter: {audioChapters.length ? (audioChapters[audioChapterAtTime(audioChapters, current)]?.title || '—') : 'No embedded chapters — sync follows EPUB chapter order only when you change chapters'} · EPUB chapter {epubChapters.length ? epubIndex + 1 : '…'} of {epubChapters.length}</span>
+      </div>
       <div className="toolbar">
         <button className="secondary" disabled={epubIndex <= 0} onClick={() => goToEpubChapter(epubIndex - 1)}>← Previous EPUB chapter</button>
         <button className="secondary" disabled={epubIndex >= epubChapters.length - 1} onClick={() => goToEpubChapter(epubIndex + 1)}>Next EPUB chapter →</button>

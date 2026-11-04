@@ -1,33 +1,75 @@
-:root { --bg: #f7f3ec; --card: #fffdf8; --ink: #241f1a; --muted: #6b625a; --accent: #7a4a21; --line: #e3d9cc; --input-bg: #ffffff; --notice-bg: #fff3d6; --notice-line: #e8c87a; --error-bg: #fde8e8; --error-line: #e5a8a8; --secondary-bg: #efe7db; }
-[data-theme="dark"] { --bg: #171512; --card: #221f1c; --ink: #ece5da; --muted: #b3a99c; --accent: #d99a5b; --line: #3d382f; --input-bg: #2a2622; --notice-bg: #3a2f1a; --notice-line: #8a6a2a; --error-bg: #3d2222; --error-line: #7a3a3a; --secondary-bg: #332e28; }
+/* ShelfSort v0.4.0 — dark-first, phone-first library.
+   :root is the dark theme (first paint is dark); light mode is opt-in
+   via [data-theme="light"]. Covers, titles and authors carry the list;
+   cloud/fix/series detail lives on the detail page, not on cards. */
+:root { --bg: #0b0b0c; --card: #161618; --ink: #f2f2f2; --muted: #a8a8ad; --accent: #e0a458; --line: #26262a; --input-bg: #1e1e22; --notice-bg: #2a2416; --notice-line: #6b5a28; --error-bg: #3d2222; --error-line: #7a3a3a; --secondary-bg: #232327; }
+[data-theme="light"] { --bg: #f7f3ec; --card: #fffdf8; --ink: #241f1a; --muted: #6b625a; --accent: #7a4a21; --line: #e3d9cc; --input-bg: #ffffff; --notice-bg: #fff3d6; --notice-line: #e8c87a; --error-bg: #fde8e8; --error-line: #e5a8a8; --secondary-bg: #efe7db; }
 * { box-sizing: border-box; }
 body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--ink); }
 a { color: var(--accent); }
 button, input, select, textarea { font: inherit; background: var(--input-bg); color: var(--ink); }
-button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; min-height: 44px; }
 button.secondary { background: var(--secondary-bg); color: var(--ink); }
 button:disabled { opacity: .5; cursor: default; }
-header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; padding: 16px; background: var(--card); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-header h1 { margin: 0; font-size: 22px; }
-header .tagline { color: var(--muted); font-size: 14px; }
-header .theme-toggle { background: var(--secondary-bg); color: var(--ink); }
-main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+/* Top bar: title + icons, then a Library / Series / Settings nav row. */
+.topbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 14px 16px 10px; background: var(--bg); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
+.topbar h1 { margin: 0; font-size: 24px; flex: 1; }
+.topbar-actions { display: flex; gap: 4px; }
+.icon-btn { background: transparent; color: var(--ink); font-size: 22px; padding: 6px 10px; min-height: 44px; }
+.topnav { display: flex; gap: 8px; width: 100%; }
+.topnav button { background: transparent; color: var(--muted); padding: 8px 12px; }
+.topnav button.active { color: var(--ink); border-bottom: 2px solid var(--accent); border-radius: 0; }
+.top-search { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); }
+main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; }
+/* Bottom format tabs: All / Books / Comics / Audiobooks, fixed at the bottom. */
+.bottom-tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; display: flex; gap: 4px; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); background: var(--bg); border-top: 1px solid var(--line); }
+.bottom-tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; background: transparent; color: var(--muted); font-size: 12px; padding: 6px 2px; min-height: 56px; border-radius: 8px; }
+.bottom-tabs button.active { color: var(--ink); }
+.bottom-tabs button.active .bt-icon { filter: none; }
+.bt-icon { font-size: 20px; }
+.bt-count { font-size: 11px; color: var(--muted); }
 .toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; align-items: center; }
-.toolbar input[type="search"], .toolbar select, .toolbar input[type="number"] { padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); }
-.dropzone { border: 2px dashed var(--line); border-radius: 12px; padding: 24px; text-align: center; background: var(--card); }
+.toolbar input[type="search"], .toolbar select, .toolbar input[type="number"] { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); min-height: 44px; }
+.dropzone { border: 2px dashed var(--line); border-radius: 12px; padding: 20px; text-align: center; background: var(--card); }
 .dropzone.drag { border-color: var(--accent); background: var(--secondary-bg); }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+/* Status tabs (ALL / NEW / STARTED / FINISHED), like reference shot 1. */
+.status-tabs { display: flex; gap: 4px; margin: 4px 0 12px; overflow-x: auto; }
+.status-tabs button { background: transparent; color: var(--muted); border-radius: 0; padding: 10px 12px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+.status-tabs button.active { color: var(--ink); border-bottom: 3px solid var(--accent); }
+/* List view: cover left, title + author right, thin progress bar. */
+.book-list { display: flex; flex-direction: column; }
+.book-row { display: flex; gap: 14px; align-items: flex-start; background: transparent; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0; text-align: left; color: var(--ink); width: 100%; }
+.row-cover { position: relative; flex: 0 0 110px; width: 110px; }
+.row-cover img, .row-cover .cover { width: 110px; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 4px; background: var(--secondary-bg); color: var(--muted); font-size: 13px; text-align: center; }
+.row-progress { display: block; height: 4px; background: var(--line); margin-top: 4px; border-radius: 2px; overflow: hidden; }
+.row-progress span { display: block; height: 100%; background: var(--accent); }
+.row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-top: 2px; }
+.row-title { font-size: 18px; font-weight: 600; line-height: 1.25; }
+.row-author { color: var(--muted); font-size: 15px; }
+/* Grid view: 3-column covers only, like reference shot 2. */
+.book-grid-wrap { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.book-grid { background: transparent; border: 0; border-radius: 4px; padding: 0; cursor: pointer; }
+.book-grid img, .book-grid .cover { width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 4px; background: var(--secondary-bg); color: var(--muted); font-size: 13px; text-align: center; }
+.book-grid-title { display: block; margin-top: 6px; font-size: 13px; line-height: 1.3; color: var(--ink); text-align: left; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.book-grid-author { display: block; margin-top: 2px; font-size: 12px; line-height: 1.3; color: var(--muted); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Series view: tag rows with count on the right, like reference shot 3. */
+.series-list { display: flex; flex-direction: column; gap: 8px; }
+.series-row { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: left; color: var(--ink); width: 100%; }
+.series-tag { font-size: 20px; }
+.series-name { flex: 1; font-size: 17px; text-align: left; }
+.series-count { color: var(--muted); font-size: 16px; }
+/* Legacy grid/card classes (kept for series-detail fallbacks). */
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .book { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px; cursor: pointer; text-align: left; color: var(--ink); }
 .book img, .cover { width: 100%; aspect-ratio: 2/3; object-fit: cover; border-radius: 8px; background: var(--secondary-bg); display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 13px; text-align: center; padding: 8px; }
 .book h3 { font-size: 15px; margin: 8px 0 2px; }
 .book p { margin: 0; color: var(--muted); font-size: 13px; }
-.book .format-badge { font-weight: 600; color: var(--ink); }
 .series-group { margin: 20px 0; }
 .series-group > h2 { font-size: 18px; cursor: pointer; }
 .gap { background: var(--notice-bg); border: 1px solid var(--notice-line); padding: 8px 10px; border-radius: 8px; font-size: 14px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 12px 0; }
 .field { display: grid; gap: 4px; margin: 8px 0; }
-.field input, .field textarea, .field select { padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); }
+.field input, .field textarea, .field select { padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); min-height: 44px; }
 .proposal { border: 1px solid var(--line); border-radius: 10px; padding: 10px; margin: 8px 0; }
 .proposal .src { color: var(--muted); font-size: 13px; }
 .reader { max-width: 760px; margin: 0 auto; }
@@ -37,6 +79,18 @@ main { max-width: 1100px; margin: 0 auto; padding: 16px; }
 .reader.dark { background: #1e1e1e; color: #e8e8e8; }
 .reader.sepia { background: #f4ecd8; color: #433422; }
 .reader .chapter { padding: 16px; border-radius: 12px; }
+/* EPUB page-turn layout: the chapter is laid out in CSS columns,
+   one column = one screen-sized page. The outer box hides the rest
+   and the flow is translated horizontally by page index (see
+   App.jsx). column-gap 32px must match the GAP constant there.
+   The reader article in ReadAlongView keeps the old scrolling
+   .chapter style above — pagination is EPUB-reader only. */
+.reader-pages { overflow: hidden; height: 62dvh; min-height: 420px; touch-action: pan-y; }
+.reader-column-flow { height: 100%; column-width: 100%; column-gap: 32px; column-fill: auto; box-sizing: border-box; transition: transform 0.18s ease; line-height: 1.7; font-size: var(--reader-size, 18px); padding: 8px; }
+.reader-column-flow img { max-width: 100%; height: auto; }
+.reader-pagebar { justify-content: space-between; align-items: center; }
+/* Pull-to-refresh indicator (library + series views only). */
+.ptr { overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px; transition: height 0.15s ease; }
 .viewer .chapter { line-height: 1.7; font-size: var(--reader-size, 18px); }
 .viewer .chapter img { max-width: 100%; height: auto; }
 .notice { background: var(--notice-bg); border: 1px solid var(--notice-line); padding: 12px; border-radius: 10px; }
@@ -54,4 +108,4 @@ main { max-width: 1100px; margin: 0 auto; padding: 16px; }
 .audio-controls input[type="range"] { width: 100%; }
 .chapter-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .chapter-row.active { font-weight: 700; }
-@media (max-width: 600px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 600px) { .grid { grid-template-columns: repeat(3, 1fr); } }

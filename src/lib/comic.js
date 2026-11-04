@@ -49,6 +49,9 @@ export async function parseCbz(arrayBuffer, fallbackName = 'Unknown comic') {
   const clean = fallbackName.replace(/\.cbz$/i, '').replace(/[_-]+/g, ' ').trim()
   return {
     title: clean,
+    // CBZ archives carry no title metadata, so the title is always
+    // filename-derived until a fix or manual edit supplies one.
+    titleFromFilename: true,
     author: '',
     creators: [],
     language: '',

@@ -51,6 +51,17 @@ export function detectSeriesFromTitle(title) {
   return null
 }
 
+// Publication date: metadata.date may be a year ("1998"), a full date
+// ("1998-03-15"), or empty/malformed. Extract the first plausible
+// 4-digit year; anything else is null (sorts last, never crashes).
+export function parsePublicationYear(raw) {
+  if (raw === null || raw === undefined) return null
+  const m = String(raw).match(/(\d{4})/)
+  if (!m) return null
+  const y = parseInt(m[1], 10)
+  return (y >= 1000 && y <= 2999) ? y : null
+}
+
 export function getSeries(book) {
   const meta = book.metadata || book
   if (meta.series) {
@@ -70,6 +81,19 @@ export function sortBooks(books, mode = 'series') {
     (a.metadata.author || '').localeCompare(b.metadata.author || '') || byTitle(a, b)
   if (mode === 'author') return list.sort(byAuthor)
   if (mode === 'title') return list.sort(byTitle)
+  if (mode === 'date') {
+    // Publication date, newest first; books with no usable date last
+    // (ties fall back to title so the order is stable).
+    return list.sort((a, b) => {
+      const ya = parsePublicationYear(a.metadata.date)
+      const yb = parsePublicationYear(b.metadata.date)
+      if (ya === null && yb === null) return byTitle(a, b)
+      if (ya === null) return 1
+      if (yb === null) return -1
+      if (yb !== ya) return yb - ya
+      return byTitle(a, b)
+    })
+  }
   if (mode === 'recent') return list.sort((a, b) => (b.addedAt || 0) - (a.addedAt || 0))
   // Series: series books first, grouped by series name, ordered by
   // index; standalones after, by author then title.
