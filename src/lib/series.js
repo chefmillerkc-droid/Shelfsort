@@ -16,6 +16,15 @@ export function parseSeriesIndex(raw) {
 
 // Returns { name, index } or null. `name` is the series name with the
 // trailing book-number part stripped.
+//
+// NOTE on "BookTitle: Series, Book N" titles (e.g. Dungeon Crawler
+// Carl): the text before ", Book N" is NOT always the series — it is
+// often "book title: series". detectSeriesFromTitle alone cannot tell
+// "A Parade of Horribles: Dungeon Crawler Carl" (series = the part
+// after the colon) from "Star Wars: A New Hope" (series = the part
+// before it), so it returns the full prefix here and groupBySeries()
+// resolves the colon case by cross-book sharing (see below): a
+// segment after the colon that is shared by 2+ books is the series.
 export function detectSeriesFromTitle(title) {
   if (!title) return null
   const t = title.trim()
@@ -116,21 +125,78 @@ export function sortBooks(books, mode = 'series') {
 // Group sorted books into series groups + a standalone bucket.
 // A group is { key, name, books, gaps } where gaps are missing
 // integer indices between the lowest and highest owned index.
+//
+// Two grouping fixes live here, not in detectSeriesFromTitle:
+//  1. Colon titles: for a title-parsed (not metadata) series whose
+//     name contains ":", the segment after the last colon is the
+//     series ONLY if 2+ books share that exact segment — e.g. every
+//     Dungeon Crawler Carl book ends "...: Dungeon Crawler Carl,
+//     Book N", so they all share "Dungeon Crawler Carl" and group
+//     under it. A lone "Series: BookTitle, Book N" keeps its full
+//     prefix, so it is no worse off than before.
+//  2. Case/punctuation variants of the same series must not split:
+//     the group key is normalized (lowercase, collapsed whitespace,
+//     punctuation stripped, leading "The " dropped), so "Red rising"
+//     and "Red Rising" land in one group. The displayed name is the
+//     most frequent exact form in the group (title-cased form wins
+//     ties), so the group shows "Red Rising", not "Red rising".
+function normalizeSeriesKey(name) {
+  return name.trim().toLowerCase().replace(/\s+/g, ' ').replace(/^the\s+/, '').replace(/[^\w\s]/g, '').trim()
+}
+function afterColonSegment(name) {
+  const parts = name.split(/[:—–-]/).map((p) => p.trim()).filter(Boolean)
+  return parts.length > 1 ? parts[parts.length - 1] : null
+}
+function pickDisplayName(forms) {
+  const counts = new Map()
+  for (const f of forms) counts.set(f, (counts.get(f) || 0) + 1)
+  const titleCased = (f) => f.split(/\s+/).filter((w) => /^[A-Z]/.test(w)).length
+  return [...counts.entries()].sort((a, b) => (b[1] - a[1]) || (titleCased(b[0]) - titleCased(a[0])) || a[0].localeCompare(b[0]))[0][0]
+}
 export function groupBySeries(books) {
+  const resolved = books.map((book) => ({ book, s: getSeries(book) }))
+  // Colon resolution: count shared after-colon segments among
+  // title/filename-parsed series only (metadata series is authoritative).
+  const segmentCounts = new Map()
+  for (const { s } of resolved) {
+    if (s.source === 'metadata' || !s.name) continue
+    const seg = afterColonSegment(s.name)
+    if (seg && seg.length >= 2) segmentCounts.set(normalizeSeriesKey(seg), (segmentCounts.get(normalizeSeriesKey(seg)) || 0) + 1)
+  }
+  for (const entry of resolved) {
+    if (entry.s.source === 'metadata' || !entry.s.name) continue
+    const seg = afterColonSegment(entry.s.name)
+    if (seg && seg.length >= 2 && (segmentCounts.get(normalizeSeriesKey(seg)) || 0) >= 2) {
+      entry.s = { ...entry.s, name: seg }
+    }
+  }
   const groups = new Map()
   const standalone = []
-  for (const book of books) {
-    const s = getSeries(book)
+  for (const { book, s } of resolved) {
     if (!s.name) {
       standalone.push(book)
       continue
     }
-    if (!groups.has(s.name)) groups.set(s.name, [])
-    groups.get(s.name).push(book)
+    const key = `series:${normalizeSeriesKey(s.name)}`
+    if (!groups.has(key)) groups.set(key, { forms: [], books: [] })
+    groups.get(key).forms.push(s.name.trim())
+    groups.get(key).books.push(book)
   }
   const out = []
-  for (const [name, list] of groups) {
-    const sorted = sortBooks(list, 'series')
+  for (const [key, g] of groups) {
+    const sorted = sortBooks(g.books, 'series')
+    // sortBooks compares getSeries() names, which for colon-titled
+    // books still differ per book — so order the group by series
+    // index here (nulls last), which is what a series screen means.
+    if (sorted.some((b) => getSeries(b).index !== null)) {
+      sorted.sort((a, b) => {
+        const ia = getSeries(a).index, ib = getSeries(b).index
+        if (ia === null && ib === null) return 0
+        if (ia === null) return 1
+        if (ib === null) return -1
+        return ia - ib
+      })
+    }
     const indices = sorted.map((b) => getSeries(b).index).filter((n) => n !== null && Number.isInteger(n))
     const gaps = []
     if (indices.length >= 2) {
@@ -138,7 +204,7 @@ export function groupBySeries(books) {
       const max = Math.max(...indices)
       for (let i = min; i <= max; i++) if (!indices.includes(i)) gaps.push(i)
     }
-    out.push({ key: `series:${name}`, name, books: sorted, gaps })
+    out.push({ key, name: pickDisplayName(g.forms), books: sorted, gaps })
   }
   out.sort((a, b) => a.name.localeCompare(b.name))
   if (standalone.length) out.push({ key: 'standalone', name: 'Standalone', books: sortBooks(standalone, 'author'), gaps: [] })
