@@ -5,6 +5,15 @@
 :root { --bg: #0b0b0c; --card: #161618; --ink: #f2f2f2; --muted: #a8a8ad; --accent: #e0a458; --line: #26262a; --input-bg: #1e1e22; --notice-bg: #2a2416; --notice-line: #6b5a28; --error-bg: #3d2222; --error-line: #7a3a3a; --secondary-bg: #232327; }
 [data-theme="light"] { --bg: #f7f3ec; --card: #fffdf8; --ink: #241f1a; --muted: #6b625a; --accent: #7a4a21; --line: #e3d9cc; --input-bg: #ffffff; --notice-bg: #fff3d6; --notice-line: #e8c87a; --error-bg: #fde8e8; --error-line: #e5a8a8; --secondary-bg: #efe7db; }
 * { box-sizing: border-box; }
+/* Document-level horizontal lock (library sideways-drag fix):
+   the whole document can NEVER be panned sideways — vertical
+   scrolling only, everywhere except intentionally scrollable strips
+   (.status-tabs, .thumb-strip, which set their own touch-action).
+   overflow-x: clip (not hidden) is used deliberately: clip creates
+   no scroll container, so sticky elements and native scrolling
+   keep working, while any content wider than the viewport is
+   simply not scrollable into view. */
+html, body, #root { overflow-x: clip; touch-action: pan-y; }
 body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--ink); }
 a { color: var(--accent); }
 button, input, select, textarea { font: inherit; background: var(--input-bg); color: var(--ink); }
@@ -13,17 +22,20 @@ button.secondary { background: var(--secondary-bg); color: var(--ink); }
 button:disabled { opacity: .5; cursor: default; }
 /* Top bar: title + icons, then a Library / Series / Settings nav row. */
 .topbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 14px 16px 10px; background: var(--bg); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 5; }
-.topbar h1 { margin: 0; font-size: 24px; flex: 1; }
+.topbar h1 { margin: 0; font-size: 24px; flex: 1; min-width: 0; overflow-wrap: break-word; }
+.toolbar > * { min-width: 0; max-width: 100%; }
+.toolbar select, .toolbar input { max-width: 100%; }
 .topbar-actions { display: flex; gap: 4px; }
 .icon-btn { background: transparent; color: var(--ink); font-size: 22px; padding: 6px 10px; min-height: 44px; }
-.topnav { display: flex; gap: 8px; width: 100%; }
+.topnav { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; max-width: 100%; min-width: 0; }
+.topnav button { min-width: 0; max-width: 100%; }
 .topnav button { background: transparent; color: var(--muted); padding: 8px 12px; }
 .topnav button.active { color: var(--ink); border-bottom: 2px solid var(--accent); border-radius: 0; }
 .top-search { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--input-bg); color: var(--ink); }
-main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; }
+main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; overflow-x: clip; touch-action: pan-y; }
 /* Bottom format tabs: All / Books / Comics / Audiobooks, fixed at the bottom. */
 .bottom-tabs { position: fixed; left: 0; right: 0; bottom: 0; z-index: 5; display: flex; gap: 4px; padding: 8px 8px calc(8px + env(safe-area-inset-bottom)); background: var(--bg); border-top: 1px solid var(--line); }
-.bottom-tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; background: transparent; color: var(--muted); font-size: 12px; padding: 6px 2px; min-height: 56px; border-radius: 8px; }
+.bottom-tabs button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; background: transparent; color: var(--muted); font-size: 12px; padding: 6px 2px; min-height: 56px; min-width: 0; border-radius: 8px; }
 .bottom-tabs button.active { color: var(--ink); }
 .bottom-tabs button.active .bt-icon { filter: none; }
 .bt-icon { font-size: 20px; }
@@ -33,28 +45,31 @@ main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; }
 .dropzone { border: 2px dashed var(--line); border-radius: 12px; padding: 20px; text-align: center; background: var(--card); }
 .dropzone.drag { border-color: var(--accent); background: var(--secondary-bg); }
 /* Status tabs (ALL / NEW / STARTED / FINISHED), like reference shot 1. */
-.status-tabs { display: flex; gap: 4px; margin: 4px 0 12px; overflow-x: auto; }
+.status-tabs { display: flex; gap: 4px; margin: 4px 0 12px; overflow-x: auto; overscroll-behavior-x: contain; touch-action: pan-x pan-y; }
 .status-tabs button { background: transparent; color: var(--muted); border-radius: 0; padding: 10px 12px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
 .status-tabs button.active { color: var(--ink); border-bottom: 3px solid var(--accent); }
 /* List view: cover left, title + author right, thin progress bar. */
 .book-list { display: flex; flex-direction: column; }
-.book-row { display: flex; gap: 14px; align-items: flex-start; background: transparent; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0; text-align: left; color: var(--ink); width: 100%; }
+.book-row { display: flex; gap: 14px; align-items: flex-start; background: transparent; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; padding: 12px 0; text-align: left; color: var(--ink); width: 100%; max-width: 100%; min-width: 0; }
 .row-cover { position: relative; flex: 0 0 110px; width: 110px; }
 .row-cover img, .row-cover .cover { width: 110px; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 4px; background: var(--secondary-bg); color: var(--muted); font-size: 13px; text-align: center; }
 .row-progress { display: block; height: 4px; background: var(--line); margin-top: 4px; border-radius: 2px; overflow: hidden; }
 .row-progress span { display: block; height: 100%; background: var(--accent); }
-.row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; padding-top: 2px; }
+.row-text { display: flex; flex-direction: column; gap: 4px; min-width: 0; max-width: 100%; padding-top: 2px; overflow-wrap: break-word; }
+.row-title, .row-author { min-width: 0; max-width: 100%; overflow-wrap: break-word; }
 .row-title { font-size: 18px; font-weight: 600; line-height: 1.25; }
 .row-author { color: var(--muted); font-size: 15px; }
 /* Grid view: 3-column covers only, like reference shot 2. */
-.book-grid-wrap { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.book-grid-wrap { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; max-width: 100%; min-width: 0; }
+.book-grid { min-width: 0; }
 .book-grid { background: transparent; border: 0; border-radius: 4px; padding: 0; cursor: pointer; }
 .book-grid img, .book-grid .cover { width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 4px; background: var(--secondary-bg); color: var(--muted); font-size: 13px; text-align: center; }
 .book-grid-title { display: block; margin-top: 6px; font-size: 13px; line-height: 1.3; color: var(--ink); text-align: left; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .book-grid-author { display: block; margin-top: 2px; font-size: 12px; line-height: 1.3; color: var(--muted); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* Series view: tag rows with count on the right, like reference shot 3. */
 .series-list { display: flex; flex-direction: column; gap: 8px; }
-.series-row { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: left; color: var(--ink); width: 100%; }
+.series-row { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: left; color: var(--ink); width: 100%; max-width: 100%; min-width: 0; }
+.series-name { min-width: 0; max-width: 100%; overflow-wrap: break-word; }
 .series-tag { font-size: 20px; }
 .series-name { flex: 1; font-size: 17px; text-align: left; }
 .series-count { color: var(--muted); font-size: 16px; }
@@ -79,15 +94,45 @@ main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; }
 .reader.dark { background: #1e1e1e; color: #e8e8e8; }
 .reader.sepia { background: #f4ecd8; color: #433422; }
 .reader .chapter { padding: 16px; border-radius: 12px; }
-/* EPUB page-turn layout: the chapter is laid out in CSS columns,
-   one column = one screen-sized page. The outer box hides the rest
-   and the flow is translated horizontally by page index (see
-   App.jsx). column-gap 32px must match the GAP constant there.
+/* EPUB page-turn layout (ReadEra-style): the chapter is laid out
+   in CSS columns, one column = one screen-sized page. The outer
+   area fills the viewport height minus the minimal header/footer,
+   not a small box. column-gap is 0 and translateX is in PIXELS
+   (pageIndex * measured pageWidth, see App.jsx), so pages never
+   drift or clip text at boundaries. While dragging, the transition
+   is off so the page follows the finger; on release it slides.
    The reader article in ReadAlongView keeps the old scrolling
    .chapter style above — pagination is EPUB-reader only. */
-.reader-pages { overflow: hidden; height: 62dvh; min-height: 420px; touch-action: pan-y; }
-.reader-column-flow { height: 100%; column-width: 100%; column-gap: 32px; column-fill: auto; box-sizing: border-box; transition: transform 0.18s ease; line-height: 1.7; font-size: var(--reader-size, 18px); padding: 8px; }
+.reader-full { max-width: 760px; margin: 0 auto; }
+.reader-minibar { flex-wrap: nowrap; }
+.reader-minibar .reader-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.reader-pages { overflow: hidden; height: calc(100dvh - 210px); min-height: 300px; touch-action: pan-y; padding: 0 16px; perspective: 1200px; }
+/* 3D page-turn: the flip wrapper carries rotateY/scale only (transform +
+   opacity on the shadow, nothing layout-affecting), while the inner
+   column strip keeps doing the pixel translateX pagination untouched.
+   This is a 3D flip, not a curved paper curl — a true curl is not
+   feasible with a CSS-column strip, so no curl is faked. */
+.reader-flip { position: relative; width: 100%; height: 100%; will-change: transform; transform-style: preserve-3d; }
+.reader-flip.turning-next { animation: reader-turn-next 0.25s ease; transform-origin: left center; }
+.reader-flip.turning-prev { animation: reader-turn-prev 0.25s ease; transform-origin: right center; }
+@keyframes reader-turn-next { 0% { transform: rotateY(0deg) scale(1); } 50% { transform: rotateY(-35deg) scale(0.97); } 100% { transform: rotateY(0deg) scale(1); } }
+@keyframes reader-turn-prev { 0% { transform: rotateY(0deg) scale(1); } 50% { transform: rotateY(35deg) scale(0.97); } 100% { transform: rotateY(0deg) scale(1); } }
+.reader-turn-shadow { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.reader-flip.turning-next .reader-turn-shadow, .reader-flip.turning-prev .reader-turn-shadow { animation: reader-shadow 0.25s ease forwards; }
+@keyframes reader-shadow { 0% { opacity: 0; } 50% { opacity: 0.45; } 100% { opacity: 0; } }
+.reader-column-flow { height: 100%; column-width: 100%; column-gap: 0; column-fill: auto; box-sizing: border-box; line-height: 1.7; font-size: var(--reader-size, 18px); padding: 0; will-change: transform; }
 .reader-column-flow img { max-width: 100%; height: auto; }
+/* Reader fit fix: strip padding MUST be 0 or pageWidth (clientWidth)
+   no longer equals the CSS column width. See comment above. */
+.reader .reader-column-flow.chapter { padding: 0; }
+/* Chapter content can never force a page wider than the screen:
+   fixed-width EPUB markup (wide images, tables, pre blocks, long
+   unbroken words) is clamped/wrapped inside the column. */
+.reader-column-flow, .viewer .chapter { overflow-wrap: break-word; word-break: break-word; }
+.reader-column-flow img, .reader-column-flow table, .reader-column-flow pre, .reader-column-flow svg, .reader-column-flow video, .reader-column-flow figure,
+.viewer .chapter img, .viewer .chapter table, .viewer .chapter pre, .viewer .chapter svg, .viewer .chapter video, .viewer .chapter figure { max-width: 100% !important; height: auto; box-sizing: border-box; }
+.reader-column-flow pre, .viewer .chapter pre { white-space: pre-wrap; overflow-x: clip; }
+.reader-column-flow table, .viewer .chapter table { table-layout: fixed; width: 100%; }
 .reader-pagebar { justify-content: space-between; align-items: center; }
 /* Pull-to-refresh indicator (library + series views only). */
 .ptr { overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px; transition: height 0.15s ease; }
@@ -101,7 +146,7 @@ main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; }
 .comic-page { display: block; margin: 12px auto; border-radius: 8px; }
 .comic-page.fit-width { width: 100%; height: auto; }
 .comic-page.fit-page { max-width: 100%; max-height: 80vh; width: auto; height: auto; }
-.thumb-strip { display: flex; gap: 8px; overflow-x: auto; padding: 8px 0; }
+.thumb-strip { display: flex; gap: 8px; overflow-x: auto; overscroll-behavior-x: contain; padding: 8px 0; }
 .thumb { background: var(--secondary-bg); border: 2px solid transparent; border-radius: 8px; padding: 4px; color: var(--ink); }
 .thumb.active { border-color: var(--accent); }
 .thumb img { width: 60px; height: 80px; object-fit: cover; display: block; border-radius: 4px; }

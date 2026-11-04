@@ -17,14 +17,19 @@
 //   - The whole player UI, chapter list, bookmarks, sleep timer,
 //     playback speed, and progress saving (see AudioPlayer in App.jsx).
 //
-// Filesystem cache note:
-//   The plugin can only play a real file URI, not an IndexedDB blob,
-//   so the audio book's bytes are copied to Capacitor's Cache
-//   directory (stable filename per book id). The copy is reused on
-//   later opens when its size matches the library file, so a large M4B
-//   is NOT recopied every time. Clearing the app cache does NOT delete
-//   the library file in IndexedDB — the cache copy is simply rebuilt
-//   on the next open.
+// Filesystem note (import-time storage, NOT a play-time cache):
+//   The plugin can only play a real file URI, not an IndexedDB blob.
+//   Audio files are therefore written ONCE at import time to
+//   Capacitor's Data directory (see src/lib/audioStore.js) and the
+//   resulting URI is stored on the book record as audioFileUri.
+//   Playback passes that URI straight to the plugin — NO copy, NO
+//   conversion, NO loading step at play time. The old play-time
+//   Cache copy is deleted from this file entirely. The only thing
+//   still written at play time is the small cover thumbnail for
+//   MediaSession artwork (ensureCoverUri, Cache directory), which
+//   is a few KB, not the audiobook, and is skipped if it fails.
+//   Deleting/uninstalling the app deletes the Data-directory files
+//   with it; a fresh install must re-import audiobooks.
 //
 // Android 13+ POST_NOTIFICATIONS — known limitation, not faked:
 //   The plugin does NOT merge POST_NOTIFICATIONS, and this codebase
@@ -48,53 +53,6 @@ const MSG_COMPLETED = 50
 const MSG_DURATION = 55
 const MSG_ERROR = 5
 const MSG_CANPLAY = 11
-
-function extFor(fileName) {
-  return /\.mp3$/i.test(fileName || '') ? 'mp3' : 'm4b'
-}
-
-function mimeFor(fileName) {
-  return /\.mp3$/i.test(fileName || '') ? 'audio/mpeg' : 'audio/mp4'
-}
-
-// Chunked ArrayBuffer -> base64. Chunk byte length is a multiple of 3
-// so each chunk's base64 has no padding, which is what makes the
-// writeFile + appendFile chunked copy below safe.
-function chunkToBase64(buf, byteOffset, byteLength) {
-  const bytes = new Uint8Array(buf, byteOffset, byteLength)
-  let out = ''
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000))
-  }
-  return btoa(out)
-}
-
-async function ensureCacheFile(book, fileBuf) {
-  const ext = extFor(book.fileName)
-  const fileName = `audio-${String(book.id).replace(/[^a-zA-Z0-9_-]/g, '_')}.${ext}`
-  const path = `shelfsort-audio/${fileName}`
-  try {
-    const st = await Filesystem.stat({ path, directory: Directory.Cache })
-    if (st && st.size === fileBuf.byteLength) {
-      const uri = await Filesystem.getUri({ path, directory: Directory.Cache })
-      return uri.uri
-    }
-  } catch { /* no cached copy yet, or stat unsupported — write it */ }
-  const CHUNK = 3 * 256 * 1024 // 786432 bytes, multiple of 3
-  let first = true
-  for (let off = 0; off < fileBuf.byteLength; off += CHUNK) {
-    const len = Math.min(CHUNK, fileBuf.byteLength - off)
-    const b64 = chunkToBase64(fileBuf, off, len)
-    if (first) {
-      await Filesystem.writeFile({ path, data: b64, directory: Directory.Cache, recursive: true })
-      first = false
-    } else {
-      await Filesystem.appendFile({ path, data: b64, directory: Directory.Cache })
-    }
-  }
-  const uri = await Filesystem.getUri({ path, directory: Directory.Cache })
-  return uri.uri
-}
 
 async function ensureCoverUri(book) {
   const cover = book.metadata && book.metadata.coverDataUrl
@@ -158,7 +116,7 @@ function createHtmlController({ fileBuf, fileName, startPosition, cbs }) {
   }
 }
 
-async function createNativeController({ book, fileBuf, startPosition, cbs, pauseOnDestroy }) {
+async function createNativeController({ book, startPosition, cbs, pauseOnDestroy }) {
   const { Playlist } = await import('capacitor-plugin-playlist')
   let handle = null
   let destroyed = false
@@ -166,7 +124,9 @@ async function createNativeController({ book, fileBuf, startPosition, cbs, pause
   let seekApplied = !pendingSeek
   const state = { position: startPosition || 0, duration: 0, playing: false }
 
-  const assetUrl = await ensureCacheFile(book, fileBuf)
+  // DIRECT playback: the file already exists in the app Data store
+  // (written at import, see audioStore.js). No copy, no conversion.
+  const assetUrl = book.audioFileUri
   const albumArt = await ensureCoverUri(book)
 
   await Playlist.setOptions({ verbose: false })
@@ -239,27 +199,37 @@ async function createNativeController({ book, fileBuf, startPosition, cbs, pause
   }
 }
 
-// One entry point for both players. `pauseOnDestroy` is false for the
-// standalone player (background playback is the point) and true for
-// read-along (leaving the read-along screen should stop the audio,
-// matching the old HTML behaviour there).
+// One entry point for both players. Native playback is ONLY used
+// when the book already has an import-time file URI (audioFileUri):
+// that URI goes straight to ExoPlayer, with no copy at play time.
+// Every other case (web build, or a book imported before the
+// import-time store existed) uses the HTML <audio> blob path —
+// silently, never a play-time cache copy, never a crash.
+// `pauseOnDestroy` is false for the standalone player (background
+// playback is the point) and true for read-along (leaving the
+// read-along screen should stop the audio, matching the old HTML
+// behaviour there).
 export async function createAudioController(opts) {
   const { book, fileBuf, startPosition = 0 } = opts
-  if (!book || !fileBuf) throw new Error('No audio file to play.')
-  if (Capacitor.isNativePlatform()) {
+  if (!book) throw new Error('No audio file to play.')
+  if (Capacitor.isNativePlatform() && book.audioFileUri) {
     try {
       return await createNativeController(opts)
     } catch (e) {
-      // Native failed (plugin missing, cache write failed, ExoPlayer
-      // rejected the file, …) — fall back to HTML rather than silence.
-      // The caller may surface opts.cbs.onError / the returned mode.
-      try {
-        const html = createHtmlController({ fileBuf, fileName: book.fileName, startPosition, cbs: opts.cbs || {} })
-        html.fallbackFromNative = true
-        html.fallbackError = e
-        return html
-      } catch { throw e }
+      // Native failed (plugin missing, ExoPlayer rejected the file,
+      // …) — fall back to HTML if a blob is available, rather than
+      // silence. If no blob exists either, surface the original error.
+      if (fileBuf) {
+        try {
+          const html = createHtmlController({ fileBuf, fileName: book.fileName, startPosition, cbs: opts.cbs || {} })
+          html.fallbackFromNative = true
+          html.fallbackError = e
+          return html
+        } catch { /* fall through to throw */ }
+      }
+      throw e
     }
   }
+  if (!fileBuf) throw new Error('No audio file to play.')
   return createHtmlController({ fileBuf, fileName: book.fileName, startPosition, cbs: opts.cbs || {} })
 }

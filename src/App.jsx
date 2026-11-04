@@ -7,7 +7,10 @@ import { parseAudio, parseMp3Tags, formatTime } from './lib/audio.js'
 import { enrichBook } from './lib/enrich.js'
 import { groupBySeries, getSeries, sortBooks } from './lib/series.js'
 import { createAudioController } from './lib/nativeAudio.js'
+import { pageTurnHaptic } from './lib/haptics.js'
+import { storeAudioFile } from './lib/audioStore.js'
 import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
+import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
@@ -151,6 +154,9 @@ export default function App() {
   const [proposals, setProposals] = useState([])
   const [enriching, setEnriching] = useState(false)
   const [enrichStatus, setEnrichStatus] = useState('')
+  // Muse catalog export / import (no backdoor: files the owner chooses to share/load).
+  const [catalogPreview, setCatalogPreview] = useState(null)
+  const [catalogStatus, setCatalogStatus] = useState('')
   // Auto-apply high-confidence fixes (only ask when unsure).
   // Default ON; turning it off restores ask-every-time behaviour.
   const [autoApplyHigh, setAutoApplyHigh] = useState(() => {
@@ -178,6 +184,27 @@ export default function App() {
   const pageIndexRef = useRef(0)
   const pageCountRef = useRef(1)
   const pagePendingRef = useRef(null) // 'last' | fraction 0..1 | null
+  // ReadEra-style page turning: dragOffset follows the finger live
+  // (px), dragging disables the slide transition; pageWidth is the
+  // measured pixel width of one column, so translateX is in px, not %.
+  const [dragOffset, setDragOffset] = useState(0)
+  const [dragging, setDragging] = useState(false)
+  // 3D page-turn: a transient snap animation (next/prev) applied to the
+  // flip wrapper below. During a drag, the tilt is driven directly
+  // from dragOffset (see the reader JSX); during a tap/button turn,
+  // this keyframed animation peaks mid-turn and settles back to 0.
+  // It never touches pagination — pageIndex/pageCount are unchanged.
+  const [turnAnim, setTurnAnim] = useState(null) // { dir: 1 next | -1 prev, key } | null
+  const turnAnimTimeoutRef = useRef(null)
+  function startTurnAnim(dir) {
+    if (turnAnimTimeoutRef.current) clearTimeout(turnAnimTimeoutRef.current)
+    setTurnAnim({ dir, key: Date.now() })
+    turnAnimTimeoutRef.current = setTimeout(() => setTurnAnim(null), 260)
+  }
+  const [pageWidth, setPageWidth] = useState(0)
+  const [readerToolbar, setReaderToolbar] = useState(false)
+  const dragRef = useRef(null)
+  const suppressClickRef = useRef(false)
   const prevReaderFontRef = useRef(fontSize)
   const prevReaderChapterRef = useRef(0)
   // Pull-to-refresh (library + series views only).
@@ -215,6 +242,7 @@ export default function App() {
 
   const fileRef = useRef(null)
   const folderRef = useRef(null)
+  const catalogFileRef = useRef(null)
 
   // Metadata only — this is the fix for the 300-book crash/empty-library
   // cycle: loading the library must NEVER pull 300 file blobs into RAM.
@@ -285,7 +313,22 @@ export default function App() {
           hasFile: true,
         }
         await putBookMeta(meta)
-        await putBookFile(id, buf)
+        // Audio: written ONCE at import to the app file store
+        // (audioStore.js); the resulting URI is the playback source
+        // and NO blob is stored in IndexedDB for audio (no double
+        // storage). If that store fails (e.g. web build), fall back
+        // to the IndexedDB blob + HTML player path instead of
+        // failing the import.
+        if (parsed.format === 'audio') {
+          const uri = await storeAudioFile(id, file.name, buf)
+          if (uri) {
+            await putBookMeta({ ...meta, audioFileUri: uri })
+          } else {
+            await putBookFile(id, buf)
+          }
+        } else {
+          await putBookFile(id, buf)
+        }
         imported++
         setImportStatus(`Imported ${imported} of ${files.length} — ${meta.metadata.title}`)
       } catch (e) {
@@ -421,6 +464,43 @@ export default function App() {
     }
   }
 
+  // ---- Muse catalog export / import ------------------------------------
+  function exportCatalog() {
+    const catalog = buildCatalog(books)
+    downloadBlob(new Blob([JSON.stringify(catalog, null, 2)], { type: 'application/json' }), 'shelfsort-catalog.json')
+    setCatalogStatus(`Exported ${catalog.books.length} book${catalog.books.length === 1 ? '' : 's'} — metadata only, no book files, covers, or credentials. Share this file when you want the catalog sorted, then import the corrected file back.`)
+  }
+
+  async function previewCatalogFile(file) {
+    setCatalogStatus('')
+    try {
+      const text = await file.text()
+      const entries = parseCatalog(text)
+      setCatalogPreview(computeCatalogChanges(books, entries))
+    } catch (e) {
+      setCatalogPreview(null)
+      setCatalogStatus(`Could not read that catalog: ${e.message}`)
+    }
+  }
+
+  async function applyCatalogPreview() {
+    if (!catalogPreview) return
+    let applied = 0
+    for (const change of catalogPreview.changes) {
+      const book = books.find((b) => b.id === change.bookId)
+      if (!book) continue
+      const patch = {}
+      for (const d of change.diffs) patch[d.field] = d.to
+      const updated = { ...book, metadata: { ...book.metadata, ...patch } }
+      if (change.diffs.some((d) => d.field === 'title')) updated.titleFromFilename = false
+      await putBookMeta(updated)
+      applied++
+    }
+    setCatalogPreview(null)
+    setCatalogStatus(`Applied ${applied} book${applied === 1 ? '' : 's'} from the catalog. ${catalogPreview.unmatched.length ? `${catalogPreview.unmatched.length} catalog entr${catalogPreview.unmatched.length === 1 ? 'y' : 'ies'} did not match a book in this library and were skipped.` : ''}`)
+    await reload()
+  }
+
   // ---- Detail editing / linking ---------------------------------------
   async function saveDetailEdits(book, patch) {
     const updated = { ...book, metadata: { ...book.metadata, ...patch } }
@@ -455,6 +535,11 @@ export default function App() {
   // leaves a viewer screen. Cloud-only books download from R2 first.
   async function ensureLocalFile(book) {
     if (openFiles[book.id]) return openFiles[book.id]
+    // Audio books with an import-time file URI need NO blob: the
+    // native player plays straight from that URI (audioStore.js).
+    // Returning null here lets openViewer / read-along proceed
+    // without trying to load a blob that was never stored.
+    if (book.format === 'audio' && book.audioFileUri) return null
     if (book.hasFile) {
       const buf = await getBookFile(book.id)
       if (buf) { setOpenFiles((prev) => ({ ...prev, [book.id]: buf })); return buf }
@@ -624,11 +709,15 @@ export default function App() {
   // applied once that chapter has been repaginated).
   function nextPage() {
     if (pageIndexRef.current < pageCountRef.current - 1) {
+      startTurnAnim(1)
+      pageTurnHaptic('light')
       const p = pageIndexRef.current + 1
       pageIndexRef.current = p
       setPageIndex(p)
       if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
     } else if (chapterIndex < chapters.length - 1) {
+      startTurnAnim(1)
+      pageTurnHaptic('medium')
       pagePendingRef.current = null
       goToChapter(selected, chapterIndex + 1, chapters.length, 0)
     } else if (selected) {
@@ -638,11 +727,15 @@ export default function App() {
 
   function prevPage() {
     if (pageIndexRef.current > 0) {
+      startTurnAnim(-1)
+      pageTurnHaptic('light')
       const p = pageIndexRef.current - 1
       pageIndexRef.current = p
       setPageIndex(p)
       if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
     } else if (chapterIndex > 0) {
+      startTurnAnim(-1)
+      pageTurnHaptic('medium')
       pagePendingRef.current = 'last'
       goToChapter(selected, chapterIndex - 1, chapters.length, 0)
     }
@@ -661,8 +754,13 @@ export default function App() {
       if (cancelled) return
       const el = pageRef.current
       if (!el || !el.clientWidth) return
-      const GAP = 32 // must match column-gap in styles.css
-      const count = Math.max(1, Math.round((el.scrollWidth + GAP) / (el.clientWidth + GAP)))
+      // column-gap is 0 AND strip padding is forced to 0 (styles.css
+      // .reader .reader-column-flow.chapter beats .reader .chapter's
+      // 16px padding), so one page = one clientWidth in pixels, with
+      // no drift or clipped text at boundaries. The 16px visual inset
+      // lives on the outer .reader-pages container instead.
+      const count = Math.max(1, Math.round(el.scrollWidth / el.clientWidth))
+      if (el.clientWidth !== pageWidth) setPageWidth(el.clientWidth)
       const fontChanged = prevReaderFontRef.current !== fontSize
       const chapterChanged = prevReaderChapterRef.current !== chapterIndex
       prevReaderFontRef.current = fontSize
@@ -691,32 +789,56 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view, chapterIndex, chapters, fontSize])
 
-  // Tap / swipe page-turn on the page area. Tap left third = previous,
-  // tap right third = next, middle = no-op (so text/links are not
-  // hijacked). Swipe left = next, swipe right = previous.
+  // ReadEra-style page turning on the page area. The swipe FOLLOWS
+  // the finger: touchmove applies the drag offset live (px), and on
+  // release the page snaps to next/previous when the drag passes
+  // ~25% of the page width or is a fast flick, otherwise snaps back.
+  // A tap on the left/right thirds still turns a page; a tap in the
+  // middle toggles the toolbar. The click that follows a swipe is
+  // suppressed, so a page never turns twice for one gesture.
   const readerTouch = useRef(null)
   function onReaderTouchStart(e) {
     const t = e.touches[0]
-    readerTouch.current = { x: t.clientX, y: t.clientY }
+    readerTouch.current = { x: t.clientX, y: t.clientY, t: Date.now() }
+    dragRef.current = { x: t.clientX, t: Date.now(), moved: false }
   }
-  function onReaderTouchEnd(e) {
-    const s = readerTouch.current
-    readerTouch.current = null
-    if (!s) return
-    const t = e.changedTouches[0]
-    const dx = t.clientX - s.x
-    const dy = t.clientY - s.y
-    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
-      if (dx < 0) nextPage()
-      else prevPage()
+  function onReaderTouchMove(e) {
+    const d = dragRef.current
+    if (!d) return
+    const t = e.touches[0]
+    const dx = t.clientX - d.x
+    if (Math.abs(dx) > 8) {
+      d.moved = true
+      setDragging(true)
+      // Clamp the live offset so a drag cannot jump past one page.
+      const w = pageWidth || e.currentTarget.clientWidth || 300
+      setDragOffset(Math.max(-w, Math.min(w, dx)))
     }
   }
+  function onReaderTouchEnd(e) {
+    const d = dragRef.current
+    dragRef.current = null
+    setDragging(false)
+    setDragOffset(0)
+    if (!d || !d.moved) return
+    suppressClickRef.current = true
+    const t = e.changedTouches[0]
+    const dx = t.clientX - d.x
+    const dt = Math.max(1, Date.now() - d.t)
+    const w = pageWidth || 300
+    const flick = Math.abs(dx) > 50 && (Math.abs(dx) / dt) > 0.5 // px/ms
+    if (dx < -w * 0.25 || (dx < 0 && flick)) nextPage()
+    else if (dx > w * 0.25 || (dx > 0 && flick)) prevPage()
+    // else: snap back (dragOffset reset above restores the page)
+  }
   function onReaderClick(e) {
-    if (e.target && e.target.closest && e.target.closest('a,button')) return
+    if (suppressClickRef.current) { suppressClickRef.current = false; return }
+    if (e.target && e.target.closest && e.target.closest('a,button,input,select,textarea,label')) return
     const rect = e.currentTarget.getBoundingClientRect()
     const frac = (e.clientX - rect.left) / Math.max(1, rect.width)
     if (frac < 0.3) prevPage()
     else if (frac > 0.7) nextPage()
+    else setReaderToolbar((v) => !v)
   }
 
   // Pull-to-refresh: library + series + Unsorted views only, and only when the
@@ -821,7 +943,24 @@ export default function App() {
     return list
   }, [books, search, formatTab])
   const seriesGroups = useMemo(() => groupBySeries(seriesBase), [seriesBase])
-  const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'cloud' ? 'Cloud' : view === 'fixes' ? 'Fix Review' : 'Library'
+  const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'fixes' ? 'Fix Review' : 'Library'
+  // 3D page-turn values, derived from the existing drag state (no new
+  // renders beyond the drag itself). While dragging, the flip wrapper
+  // tilts up to ~35deg in the turn direction and dips to 0.97 scale,
+  // with a shadow that darkens with progress; on release / tap the
+  // CSS snap animation (turnAnim class) takes over and settles to 0.
+  const turnW = pageWidth || 300
+  const turnProgress = dragging ? Math.min(1, Math.abs(dragOffset) / turnW) : 0
+  const turnDir = dragOffset < 0 ? 1 : -1 // 1 = next page, -1 = previous
+  const flipStyle = dragging && dragOffset !== 0
+    ? { transform: `rotateY(${turnDir > 0 ? -35 * turnProgress : 35 * turnProgress}deg) scale(${1 - 0.03 * turnProgress})`, transformOrigin: turnDir > 0 ? 'left center' : 'right center' }
+    : {}
+  const flipShadowStyle = {
+    opacity: dragging ? 0.45 * turnProgress : 0,
+    background: turnDir > 0
+      ? 'linear-gradient(to left, rgba(0,0,0,0.55), rgba(0,0,0,0) 60%)'
+      : 'linear-gradient(to right, rgba(0,0,0,0.55), rgba(0,0,0,0) 60%)',
+  }
   const detail = selected && books.find((b) => b.id === selected.id)
   const detailPair = detail ? linkedPairFor(detail) : null
   const detailAuto = detail ? autoMatchFor(detail) : null
@@ -843,7 +982,7 @@ export default function App() {
           <button className={view === 'library' ? 'active' : ''} onClick={() => setView('library')}>Library</button>
           <button className={view === 'series' || view === 'series-detail' ? 'active' : ''} onClick={() => setView('series')}>Series</button>
           <button className={view === 'unsorted' ? 'active' : ''} onClick={() => setView('unsorted')}>Unsorted{books.filter(isUnsorted).length ? ` (${books.filter(isUnsorted).length})` : ''}</button>
-          <button className={view === 'settings' || view === 'cloud' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
+          <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
         </nav>
         {searchOpen && (
           <input className="top-search" type="search" placeholder="Search title, author, or series…" value={search} onChange={(e) => setSearch(e.target.value)} autoFocus />
@@ -1012,9 +1151,29 @@ export default function App() {
               <p className="progress">High confidence means an ISBN match to the same edition, or an exact title + author match with a single result. Everything uncertain goes to Fix Review.</p>
             </div>
             <div className="card">
-              <h2>Cloud shelf</h2>
-              <p className="progress">Keep the catalog on your phone and the big files in your private Cloudflare R2 bucket, or clear local copies after upload.</p>
-              <button className="secondary" onClick={() => setView('cloud')}>☁️ Cloud / Settings</button>
+              <h2>Muse catalog — export / import</h2>
+              <p className="progress">Let Muse sort the whole catalog — series, series order, authors, titles — without any backdoor or live access to your phone. Export a metadata-only catalog, share that file, then import the corrected file back. Nothing is applied until you press Apply, and import only changes title, author, publisher, date, ISBN, description, series, and series number. Book files, covers, reading progress, and cloud credentials are never in a catalog file and are never changed by an import.</p>
+              <div className="toolbar">
+                <button onClick={exportCatalog} disabled={!books.length}>Export catalog ({books.length})</button>
+                <button className="secondary" onClick={() => catalogFileRef.current.click()}>Import catalog…</button>
+              </div>
+              <input ref={catalogFileRef} type="file" accept=".json,application/json" hidden onChange={(e) => { if (e.target.files[0]) previewCatalogFile(e.target.files[0]); e.target.value = '' }} />
+              {catalogStatus && <p className="progress">{catalogStatus}</p>}
+              {catalogPreview && (
+                <div>
+                  <p className="progress">{catalogPreview.changes.length} book{catalogPreview.changes.length === 1 ? '' : 's'} would change, {catalogPreview.unchanged} unchanged, {catalogPreview.unmatched.length} unmatched and skipped.</p>
+                  {catalogPreview.changes.slice(0, 20).map((c) => (
+                    <div key={c.bookId} className="progress">
+                      <strong>{c.title || c.fileName}</strong>: {c.diffs.map((d) => `${d.field}: ${d.from === null || d.from === '' ? '—' : d.from} → ${d.to === null || d.to === '' ? '—' : d.to}`).join(' · ')}
+                    </div>
+                  ))}
+                  {catalogPreview.changes.length > 20 && <p className="progress">…and {catalogPreview.changes.length - 20} more.</p>}
+                  <div className="toolbar">
+                    <button onClick={applyCatalogPreview}>Apply these changes</button>
+                    <button className="secondary" onClick={() => setCatalogPreview(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="card">
               <h2>Library</h2>
@@ -1037,7 +1196,6 @@ export default function App() {
                 <p>Publisher: {detail.metadata.publisher || '—'} · Date: {detail.metadata.date || '—'} · ISBN: {detail.metadata.isbn || '—'}</p>
                 <p>Series: {detail.metadata.series || getSeries(detail).name || '—'} {detail.metadata.seriesIndex ? `#${detail.metadata.seriesIndex}` : ''}</p>
                 <p>{detail.metadata.description || 'No description in this file.'}</p>
-                <p>☁️ Cloud: {cloudStatusLabel(detail)}{detail.r2Key ? ` · ${detail.r2Key}` : ''}</p>
                 {detail.autoApplied && detail.autoApplied.length > 0 && (
                   <div className="notice">
                     <strong>Auto-fixed (high confidence only):</strong>
@@ -1057,15 +1215,12 @@ export default function App() {
                   }} />
                   Finished
                 </label>
-                <p className="progress">Status: {statusOf(detail)} · {detail.hasFile ? '📱 Local' : 'No local file'}{detail.r2Key ? ' · ☁️ In R2' : ''}</p>
-                <div className="toolbar">
-                  {!r2Settings && <button className="secondary" onClick={() => setView('cloud')}>Set up Cloud / R2</button>}
-                  {r2Settings && detail.hasFile && !detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail); setSelected(u); await reload(); setCloudMsg(`Uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Upload to R2</button>}
-                  {r2Settings && detail.hasFile && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await uploadBook(detail, true); setSelected(u); await reload(); setCloudMsg(`Re-uploaded "${detail.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) } }}>☁️ Re-upload to R2</button>}
-                  {r2Settings && detail.hasFile && detail.r2Key && <button className="secondary" onClick={async () => { try { const u = await clearLocalFor(detail); setSelected(u); await reload(); setCloudMsg(`Local copy cleared for "${detail.metadata.title}". Metadata, cover, series and progress are kept; open it anytime to download it again.`) } catch (e) { setCloudMsg(`Clear local failed: ${friendlyR2Error(e)}`) } }}>🧹 Clear local (keep in R2)</button>}
-                  {r2Settings && !detail.hasFile && detail.r2Key && <button onClick={() => openBook(detail)}>☁️ Download from R2 & open</button>}
-                  {r2Settings && detail.r2Key && <button className="secondary" onClick={async () => { if (!confirm(`Delete "${detail.metadata.title}" from R2? The local copy (if any) is kept, but the cloud copy will be gone.`)) return; try { const u = await deleteFromCloudFor(detail); setSelected(u); await reload(); setCloudMsg(`Deleted "${detail.metadata.title}" from R2.`) } catch (e) { setCloudMsg(`Delete from cloud failed: ${friendlyR2Error(e)}`) } }}>🗑️ Delete from R2</button>}
-                </div>
+                <p className="progress">Status: {statusOf(detail)} · {detail.hasFile ? '📱 Local' : 'Download on open'}</p>
+                {(!detail.hasFile && detail.r2Key) && (
+                  <div className="toolbar">
+                    <button onClick={() => openBook(detail)}>Download & open</button>
+                  </div>
+                )}
                 {detail.cbrUnsupported && (
                   <div className="error">
                     <strong>CBR cannot be opened yet.</strong> CBR is a RAR archive, not a zip, and there is no reliable browser RAR unpacker bundled here.
@@ -1131,103 +1286,6 @@ export default function App() {
           </div>
         )}
 
-        {view === 'cloud' && (
-          <CloudView
-            books={books}
-            r2Settings={r2Settings}
-            r2Form={r2Form}
-            setR2Form={setR2Form}
-            showSecret={showSecret}
-            setShowSecret={setShowSecret}
-            cloudMsg={cloudMsg}
-            cloudProgress={cloudProgress}
-            cloudBusy={cloudBusy}
-            syncObjects={syncObjects}
-            syncMsg={syncMsg}
-            corsCopied={corsCopied}
-            onBack={() => setView('library')}
-            onSaveSettings={(form) => { saveR2Settings(form); setR2Settings(form); setCloudMsg('R2 settings saved in this browser only. They are not in the repo and are never sent anywhere except to your R2 endpoint.') }}
-            onClearSettings={() => { clearR2Settings(); setR2Settings(null); setR2Form({ accountId: '', bucket: '', accessKeyId: '', secretAccessKey: '', endpoint: '' }); setCloudMsg('R2 credentials cleared from this browser.') }}
-            onTest={async () => {
-              setCloudBusy(true); setCloudMsg('Testing connection…')
-              try { await testR2Connection(r2Form); setCloudMsg('✓ Connection works — R2 responded to a list request for this bucket.') }
-              catch (e) { setCloudMsg(`✗ Connection failed: ${friendlyR2Error(e)}`) }
-              finally { setCloudBusy(false) }
-            }}
-            onCopyCors={async () => {
-              try { await navigator.clipboard.writeText(R2_CORS_JSON); setCorsCopied(true); setTimeout(() => setCorsCopied(false), 3000) }
-              catch { setCloudMsg('Could not copy automatically — select the CORS JSON below and copy it manually.') }
-            }}
-            onUploadAll={async () => {
-              if (!r2Settings) { setCloudMsg('Enter and save your R2 settings first.'); return }
-              setCloudBusy(true)
-              const pending = books.filter((b) => b.hasFile && !b.r2Key)
-              let ok = 0; const errs = []
-              for (let i = 0; i < pending.length; i++) {
-                setCloudMsg(`Uploading ${i + 1} of ${pending.length}: ${pending[i].metadata.title}`)
-                try { const u = await uploadBook(pending[i]); await reload(); if (u.r2Key) ok++ } catch (e) { errs.push(`${pending[i].metadata.title}: ${friendlyR2Error(e)}`) }
-              }
-              setCloudMsg(`Upload all done: ${ok} uploaded, ${errs.length} failed.${errs.length ? ' ' + errs.join(' | ') : ''}`)
-              setCloudBusy(false)
-            }}
-            onClearAllLocal={async () => {
-              if (!r2Settings) { setCloudMsg('Enter and save your R2 settings first.'); return }
-              if (!confirm('Clear local copies for every book that is safely in R2? Metadata, covers, series and progress stay in the library; files can be downloaded again on demand.')) return
-              setCloudBusy(true)
-              let ok = 0; const errs = []
-              for (const b of books.filter((x) => x.hasFile && x.r2Key)) {
-                try { await clearLocalFor(b); ok++ } catch (e) { errs.push(`${b.metadata.title}: ${friendlyR2Error(e)}`) }
-              }
-              await reload()
-              setCloudMsg(`Cleared local copies for ${ok} book(s).${errs.length ? ` ${errs.length} skipped: ${errs.join(' | ')}` : ''}`)
-              setCloudBusy(false)
-            }}
-            onSync={async () => {
-              if (!r2Settings) { setSyncMsg('Enter and save your R2 settings first.'); return }
-              setSyncMsg('Listing R2 objects…')
-              try {
-                const objs = await listR2Objects(r2Settings)
-                setSyncObjects(objs)
-                const known = new Set(books.map((b) => b.r2Key).filter(Boolean))
-                const unknown = objs.filter((o) => !known.has(o.key))
-                setSyncMsg(`Found ${objs.length} object(s) in R2, ${unknown.length} not in this library.`)
-              } catch (e) { setSyncMsg(`Sync failed: ${friendlyR2Error(e)}`) }
-            }}
-            onImportCloudObject={async (obj) => {
-              const id = idFromR2Key(obj.key)
-              const existing = id ? books.find((b) => b.id === id) : null
-              if (existing) { setSyncMsg(`"${existing.metadata.title}" is already in the library.`); return }
-              const ext = obj.key.split('.').pop().toLowerCase()
-              const format = ext === 'pdf' ? 'pdf' : (ext === 'cbz' || ext === 'cbr' ? 'comic' : (ext === 'm4b' || ext === 'mp3' ? 'audio' : 'epub'))
-              const book = {
-                id: id || uid(),
-                fileName: obj.key.split('/').pop(),
-                hasFile: false,
-                format,
-                metadata: { title: titleFromR2Key(obj.key), titleFromFilename: true, author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 },
-                audioChapters: [],
-                cbrUnsupported: ext === 'cbr',
-                addedAt: Date.now(),
-                progress: null,
-                fixedFields: [],
-                r2Key: obj.key,
-              }
-              await putBookMeta(book)
-              await reload()
-              setSyncMsg(`Added "${book.metadata.title}" as Cloud only. Open it to download it, then its real metadata/cover will be parsed on import — or download it and re-import locally for full metadata.`)
-            }}
-            onDownloadBook={async (book) => {
-              try { await ensureLocal(book); setOpenFiles((prev) => { const next = { ...prev }; delete next[book.id]; return next }); setCloudMsg(`Downloaded "${book.metadata.title}" — it is now local again.`) } catch (e) { setCloudMsg(`Download failed: ${friendlyR2Error(e)}`) }
-            }}
-            onUploadBook={async (book) => {
-              try { await uploadBook(book); await reload(); setCloudMsg(`Uploaded "${book.metadata.title}" to R2.`) } catch (e) { setCloudMsg(`Upload failed: ${friendlyR2Error(e)}`) }
-            }}
-            onClearLocalBook={async (book) => {
-              try { await clearLocalFor(book); await reload(); setCloudMsg(`Local copy cleared for "${book.metadata.title}".`) } catch (e) { setCloudMsg(`Clear local failed: ${friendlyR2Error(e)}`) }
-            }}
-          />
-        )}
-
         {view === 'fixes' && (
           <div>
             <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
@@ -1276,46 +1334,55 @@ export default function App() {
         )}
 
         {view === 'reader' && selected && (
-          <div className={`reader ${readerTheme}`}>
-            <button className="secondary" onClick={() => setView('detail')}>← Back to book</button>
-            <h2>{selected.metadata.title}</h2>
-            <div className="toolbar">
-              <button className="secondary" disabled={chapterIndex <= 0} onClick={() => goToChapter(selected, chapterIndex - 1, chapters.length)}>← Previous chapter</button>
-              <button className="secondary" disabled={chapterIndex >= chapters.length - 1} onClick={() => goToChapter(selected, chapterIndex + 1, chapters.length)}>Next chapter →</button>
-              <select value={chapterIndex} onChange={(e) => goToChapter(selected, Number(e.target.value), chapters.length)}>
-                {chapters.map((ch, i) => <option key={i} value={i}>{ch.title || `Chapter ${i + 1}`}</option>)}
-              </select>
-              <label>Font <input type="range" min="14" max="26" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))} /></label>
-              <select value={readerTheme} onChange={(e) => setReaderTheme(e.target.value)}>
-                <option value="light">Reader: Light</option>
-                <option value="dark">Reader: Dark</option>
-                <option value="sepia">Reader: Sepia</option>
-              </select>
-              {linkedPairFor(selected) && <button onClick={() => openReadAlong(selected)}>🎧 Read along</button>}
+          <div className={`reader reader-full ${readerTheme}`}>
+            <div className="toolbar reader-minibar">
+              <button className="secondary" onClick={() => setView('detail')}>← Back</button>
+              <span className="reader-title">{selected.metadata.title}</span>
+              <button className="secondary" onClick={() => setReaderToolbar((v) => !v)} aria-label="Reader settings">Aa</button>
             </div>
-            <div className="toolbar">
-              <input type="search" placeholder="Search in this book…" value={readerSearch} onChange={(e) => setReaderSearch(e.target.value)} />
-              <button className="secondary" onClick={searchInBook}>Search</button>
-            </div>
-            {readerHits.length > 0 && (
-              <div className="card">
-                {readerHits.map((h, i) => (
-                  <div key={i}><button className="secondary" onClick={() => { pagePendingRef.current = h.frac; goToChapter(selected, h.chapter, chapters.length, 0); setReaderHits([]) }}>{h.title}</button> …{h.snippet}…</div>
-                ))}
-              </div>
+            {readerToolbar && (
+              <>
+                <div className="toolbar">
+                  <button className="secondary" disabled={chapterIndex <= 0} onClick={() => goToChapter(selected, chapterIndex - 1, chapters.length)}>← Previous chapter</button>
+                  <button className="secondary" disabled={chapterIndex >= chapters.length - 1} onClick={() => goToChapter(selected, chapterIndex + 1, chapters.length)}>Next chapter →</button>
+                  <select value={chapterIndex} onChange={(e) => goToChapter(selected, Number(e.target.value), chapters.length)}>
+                    {chapters.map((ch, i) => <option key={i} value={i}>{ch.title || `Chapter ${i + 1}`}</option>)}
+                  </select>
+                  <label>Font <input type="range" min="14" max="26" value={fontSize} onChange={(e) => setFontSize(Number(e.target.value))} /></label>
+                  <select value={readerTheme} onChange={(e) => setReaderTheme(e.target.value)}>
+                    <option value="light">Reader: Light</option>
+                    <option value="dark">Reader: Dark</option>
+                    <option value="sepia">Reader: Sepia</option>
+                  </select>
+                  {linkedPairFor(selected) && <button onClick={() => openReadAlong(selected)}>🎧 Read along</button>}
+                </div>
+                <div className="toolbar">
+                  <input type="search" placeholder="Search in this book…" value={readerSearch} onChange={(e) => setReaderSearch(e.target.value)} />
+                  <button className="secondary" onClick={searchInBook}>Search</button>
+                </div>
+                {readerHits.length > 0 && (
+                  <div className="card">
+                    {readerHits.map((h, i) => (
+                      <div key={i}><button className="secondary" onClick={() => { pagePendingRef.current = h.frac; goToChapter(selected, h.chapter, chapters.length, 0); setReaderHits([]) }}>{h.title}</button> …{h.snippet}…</div>
+                    ))}
+                  </div>
+                )}
+              </>
             )}
             {!chapters.length ? <p className="progress">Loading chapters…</p> : (
               <>
-                <div className="reader-pages" onTouchStart={onReaderTouchStart} onTouchEnd={onReaderTouchEnd} onClick={onReaderClick}>
-                  <div ref={pageRef} className="reader-column-flow chapter" style={{ ['--reader-size']: `${fontSize}px`, transform: `translateX(${-pageIndex * 100}%)` }}
-                    dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
+                <div className="reader-pages" onTouchStart={onReaderTouchStart} onTouchMove={onReaderTouchMove} onTouchEnd={onReaderTouchEnd} onClick={onReaderClick}>
+                  <div className={`reader-flip${turnAnim ? ` turning-${turnAnim.dir > 0 ? 'next' : 'prev'}` : ''}`} style={flipStyle}>
+                    <div ref={pageRef} className="reader-column-flow chapter" style={{ ['--reader-size']: `${fontSize}px`, transform: `translateX(${-(pageIndex * (pageWidth || 0)) + dragOffset}px)`, transition: dragging ? 'none' : 'transform 0.25s ease' }}
+                      dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
+                    <div className="reader-turn-shadow" style={flipShadowStyle} aria-hidden="true" />
+                  </div>
                 </div>
                 <div className="toolbar reader-pagebar">
-                  <button className="secondary" onClick={prevPage}>← Previous page</button>
-                  <span className="progress">Page {pageIndex + 1} of {pageCount} · Chapter {chapterIndex + 1} of {chapters.length}</span>
-                  <button className="secondary" onClick={nextPage}>Next page →</button>
+                  <button className="secondary" onClick={prevPage}>←</button>
+                  <span className="progress">Page {pageIndex + 1} of {pageCount} · Chapter {chapterIndex + 1} of {chapters.length} · {pageCount ? Math.round(((pageIndex + 1) / pageCount) * 100) : 0}%</span>
+                  <button className="secondary" onClick={nextPage}>→</button>
                 </div>
-                <p className="progress">Tap the left or right side of the page, or swipe, to turn pages. The last page of a chapter goes to the next chapter.</p>
               </>
             )}
           </div>
@@ -1766,7 +1833,7 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
       <p>{book.metadata.author || 'Unknown author'}</p>
       {playerMode === 'native' && <p className="progress">Native player — keeps playing in the background, with lock-screen / notification controls.</p>}
       {playerMode === 'html' && <p className="progress">In-app player (web fallback).</p>}
-      {loading && <p className="progress">Loading audio… (large M4Bs are copied to the app cache on first open, then reused.)</p>}
+      {loading && <p className="progress">Loading audio…</p>}
       {playerError && <p className="error">{playerError}</p>}
       <div className="audio-controls">
         <input type="range" min="0" max={duration || 0} step="1" value={Math.min(current, duration || 0)} onChange={(e) => seekTo(Number(e.target.value))} />
@@ -1856,7 +1923,7 @@ function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
   // the EPUB view is gone, so continuing audio alone would be a
   // surprise (pauseOnDestroy: true in nativeAudio.js).
   useEffect(() => {
-    if (!audioBook || !audioBook.file) return
+    if (!audioBook || (!audioBook.file && !audioBook.audioFileUri)) return
     let cancelled = false
     let ctrl = null
     const saved = audioBook.progress
@@ -1902,7 +1969,7 @@ function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
       ctrlRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [audioBook && audioBook.id, audioBook && audioBook.file])
+  }, [audioBook && audioBook.id, audioBook && audioBook.file, audioBook && audioBook.audioFileUri])
 
   function goToEpubChapter(index, seekAudio = true) {
     epubIndexRef.current = index
