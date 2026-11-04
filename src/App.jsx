@@ -8,6 +8,9 @@ import { enrichBook } from './lib/enrich.js'
 import { groupBySeries, getSeries, sortBooks } from './lib/series.js'
 import { createAudioController } from './lib/nativeAudio.js'
 import { pageTurnHaptic } from './lib/haptics.js'
+import { Capacitor } from '@capacitor/core'
+import { App as CapApp } from '@capacitor/app'
+import { Volume } from '@capawesome/capacitor-volume'
 import { paginateChapterDom, findPageForText, nextPageIndex } from './lib/paginate.js'
 import { cleanDescription } from './lib/description.js'
 import { storeAudioFile } from './lib/audioStore.js'
@@ -15,6 +18,7 @@ import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
 import { exportCatalogFile } from './lib/catalogExport.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
+import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile } from './lib/watchedFolders.js'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
   uploadToR2, downloadFromR2, headR2Object, deleteFromR2, listR2Objects,
@@ -176,9 +180,14 @@ export default function App() {
   const [view, setView] = useState('library') // library | detail | reader | fixes | pdf | comic | audio | readalong
   const viewRef = useRef(view)
   useEffect(() => { viewRef.current = view }, [view])
-  // Back navigation, REPLACED by the left-edge swipe (see below).
+  // Back navigation, REPLACED by the in-app back swipe (see below).
   // Every view that used to have an in-app Back button now exits by
-  // a swipe starting within ~24px of the left edge, moving right.
+  // a rightward swipe STARTING in the band 56-160px from the left
+  // edge. The band sits deliberately INWARD of the Pixel/Android
+  // system back-gesture zone (roughly the first ~40px): a swipe
+  // starting in the system zone is left to the system, which now
+  // exits the reader via the Capacitor backButton listener below
+  // instead of closing the app.
   // Destination map — the same destination the old Back buttons had:
   //   reader/detail/pdf/comic/audio/readalong -> detail/library as listed
   // Top-bar Library/Series/Unsorted/Settings tabs and bottom format
@@ -241,6 +250,43 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('shelfsort-auto-apply-high', autoApplyHigh ? 'on' : 'off') } catch { /* ignore */ }
   }, [autoApplyHigh])
+  // Watched library folders (v0.7.1) — NAME/PATH ONLY in localStorage.
+  // A WebView <input> pick cannot persist a folder handle across
+  // sessions, so a saved folder is never silently re-opened: on
+  // startup the app only PROMPTS, and a rescan re-opens the picker
+  // so the user grants access again. See src/lib/watchedFolders.js.
+  const [watchedFolders, setWatchedFolders] = useState(() => {
+    try { const v = JSON.parse(localStorage.getItem('shelfsort-watched-folders') || '[]'); return Array.isArray(v) ? v : [] } catch { return [] }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('shelfsort-watched-folders', JSON.stringify(watchedFolders)) } catch { /* ignore */ }
+  }, [watchedFolders])
+  // Volume keys turn pages (native plugin, see the reader effect
+  // below). Default OFF: a user who never asked for it keeps normal
+  // volume control. Persisted in localStorage; the toggle lives in
+  // Settings only — there is deliberately no popup for it.
+  const [volumeKeysTurnPages, setVolumeKeysTurnPages] = useState(() => {
+    try { return localStorage.getItem('shelfsort-volume-keys') === 'on' } catch { return false }
+  })
+  useEffect(() => { try { localStorage.setItem('shelfsort-volume-keys', volumeKeysTurnPages ? 'on' : 'off') } catch { /* ignore */ } }, [volumeKeysTurnPages])
+  const volumeKeysRef = useRef(volumeKeysTurnPages)
+  useEffect(() => { volumeKeysRef.current = volumeKeysTurnPages }, [volumeKeysTurnPages])
+  // Latest-callback refs so native listeners (registered once per
+  // reader session) always call the current turn functions instead
+  // of a stale closure's chapter/page state.
+  const nextPageRef = useRef(null)
+  const prevPageRef = useRef(null)
+  const [scanOnStartup, setScanOnStartup] = useState(() => {
+    try { return localStorage.getItem('shelfsort-scan-on-startup') !== 'off' } catch { return true }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('shelfsort-scan-on-startup', scanOnStartup ? 'on' : 'off') } catch { /* ignore */ }
+  }, [scanOnStartup])
+  const [watchStatus, setWatchStatus] = useState('')
+  const [watchPromptDismissed, setWatchPromptDismissed] = useState(false)
+  const watchFolderRef = useRef(null)
+  const folderPickModeRef = useRef('library')
+  const watchPickModeRef = useRef('add')
   // Concise summary of the last Find Fixes run's auto-applied fixes.
   const [autoFixedSummary, setAutoFixedSummary] = useState([])
   const [edits, setEdits] = useState({})
@@ -275,8 +321,10 @@ export default function App() {
   // is backface-hidden, so it reads as flipping over to reveal the
   // next page — not a tilt on a sliding page. flip = null when idle.
   const [flip, setFlip] = useState(null) // { dir, progress, target, boundary }
-  // Left-edge exit swipe: a rightward swipe STARTING within ~24px of
-  // the left edge exits the reader (see onReaderTouch*). edgeOffset
+  // In-app back swipe: a rightward swipe STARTING in the band
+  // 56-160px from the left edge exits the reader (see
+  // onReaderTouch*). The band is inward of the system gesture zone
+  // on purpose — see the top comment. edgeOffset
   // is the live drag distance, applied as a translateX on the reader
   // screen so the exit follows the finger like the flip does.
   const [edgeOffset, setEdgeOffset] = useState(0)
@@ -334,6 +382,7 @@ export default function App() {
   }
   useEffect(() => { reload().catch(() => {}) }, [])
   useEffect(() => { if (folderRef.current) folderRef.current.setAttribute('webkitdirectory', '') }, [])
+  useEffect(() => { if (watchFolderRef.current) watchFolderRef.current.setAttribute('webkitdirectory', '') }, [])
 
   // ---- Import ---------------------------------------------------------
   async function parseByFormat(file, buf) {
@@ -420,6 +469,74 @@ export default function App() {
     setImportStatus(`Done — imported ${imported} of ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
     // Metadata only — never reload full file blobs after an import.
     await reload()
+  }
+
+  // ---- Watched folders ------------------------------------------------
+  // One handler for every folder pick, so the folder-name logic and
+  // the "picker did not return a folder" message live in one place.
+  // mode: 'library' = Library "Choose a folder" (import only, do not
+  // save); 'add' = Settings "Add folder" (save + import);
+  // 'rescan' = startup/Settings rescan (import only files whose
+  // folder name matches a saved watched folder, and only files not
+  // already in the library — importFiles itself does NOT dedupe).
+  async function handleFolderPick(fileList, mode) {
+    const files = [...fileList].filter(isSupportedBookFile)
+    if (!files.length) {
+      const msg = 'No supported files found (.epub, .pdf, .cbz, .cbr, .m4b, .mp3).'
+      if (mode === 'add' || mode === 'rescan') setWatchStatus(msg); else setImportStatus(msg)
+      return
+    }
+    const groups = groupFilesByFolder(files)
+    const namedGroups = [...groups.entries()].filter(([name]) => name)
+    if (!namedGroups.length) {
+      // The phone's picker fell back to plain files: it did not
+      // return a folder, so no folder name can be saved or matched.
+      // Import the files anyway (they are usable) and say so plainly
+      // instead of silently doing nothing — but do not pretend a
+      // folder was watched.
+      await importFiles(files)
+      const msg = "The phone's picker did not return a folder — it returned individual files instead. Those files were imported, but no folder was saved or matched. To watch a folder, pick it again, or use Choose files for individual files."
+      if (mode === 'add' || mode === 'rescan') setWatchStatus(msg); else setImportStatus((prev) => `${prev} ${msg}`)
+      return
+    }
+    if (mode === 'rescan') {
+      const existing = await getAllBooksMeta()
+      const wanted = new Set(watchedFolders.map((w) => w.name.toLowerCase()))
+      let toImport = []
+      const found = {}
+      for (const [name, groupFiles] of namedGroups) {
+        if (!wanted.has(name.toLowerCase())) continue
+        found[name] = groupFiles.length
+        toImport = toImport.concat(newFilesForRescan(groupFiles, existing))
+      }
+      if (!Object.keys(found).length) {
+        setWatchStatus('No picked folder matched a saved watched folder. Re-pick one of the saved folders to rescan it.')
+        return
+      }
+      // Record what this scan found, even when nothing was new.
+      setWatchedFolders((prev) => prev.map((w) => (found[w.name] !== undefined ? { ...w, lastCount: found[w.name], lastScannedAt: Date.now() } : w)))
+      if (!toImport.length) {
+        setWatchStatus(`Rescan done — no new books in ${Object.keys(found).join(', ')}. Everything picked is already in the library.`)
+        await reload()
+        return
+      }
+      await importFiles(toImport)
+      setWatchStatus(`Rescan done — imported ${toImport.length} new book(s) from ${Object.keys(found).join(', ')}.`)
+      return
+    }
+    // 'library' and 'add': import everything picked.
+    const folderName = folderNameOfFiles(files)
+    await importFiles(files)
+    if (mode === 'add' && folderName) {
+      const count = namedGroups.find(([name]) => name === folderName)?.[1].length ?? files.length
+      setWatchedFolders((prev) => {
+        const rest = prev.filter((w) => w.name.toLowerCase() !== folderName.toLowerCase())
+        return [...rest, { name: folderName, lastCount: count, lastScannedAt: Date.now() }]
+      })
+      setWatchStatus(`Folder "${folderName}" saved as a watched folder (${count} book file(s) found on this scan). Re-pick it on a later rescan to import new books — Android does not let the app reopen it on its own.`)
+    } else if (mode === 'add') {
+      setWatchStatus("No folder name came back with this pick, so nothing was saved as a watched folder — but the files above were imported.")
+    }
   }
 
   // ---- Enrichment / Fix Review ---------------------------------------
@@ -885,14 +1002,93 @@ export default function App() {
   }, [])
   // Desktop fallback (no touch, no Back button left): Escape exits
   // the current back-able view to the same destination. Browser back
-  // and the top-bar tabs also still work.
+  // and the top-bar tabs also still work. The same handler is the
+  // web fallback for volume keys: if a browser ever delivers
+  // VolumeUp/VolumeDown keys, they turn pages in the reader when
+  // the toggle is on. (On Android the keys never reach the WebView
+  // — the native plugin below handles them instead.)
   useEffect(() => {
     const onKey = (e) => {
       if (e.key === 'Escape' && navigateBackRef.current) navigateBackRef.current(viewRef.current)
+      if (volumeKeysRef.current && viewRef.current === 'reader' && ['VolumeUp', 'VolumeDown', 'AudioVolumeUp', 'AudioVolumeDown'].includes(e.key)) {
+        e.preventDefault()
+        if (e.key === 'VolumeDown' || e.key === 'AudioVolumeDown') nextPageRef.current?.()
+        else prevPageRef.current?.()
+      }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [])
+  // Android system back (button + Pixel back gesture): Capacitor
+  // does NOT run history.back() for us, and with no listener the
+  // app exits — which is why system back used to close the app
+  // from inside a book. This listener, registered once, routes
+  // system back through the SAME navigateBack path as the in-app
+  // swipe: for a pushed history entry, navigateBack calls
+  // history.back() and the popstate handler above does the actual
+  // navigation (reader exit saves progress there), so one back
+  // press is exactly one navigation — never a setView here AND a
+  // popstate navigation. Only a top-level tab view with no back
+  // destination (Library, Series, Settings) exits the app.
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return
+    let handle = null
+    ;(async () => {
+      try {
+        handle = await CapApp.addListener('backButton', () => {
+          const v = viewRef.current
+          if (backDestinationFor(v)) {
+            if (navigateBackRef.current) navigateBackRef.current(v)
+          } else if (v === 'library' || v === 'series' || v === 'settings') {
+            CapApp.exitApp().catch(() => { /* exit is best-effort */ })
+          }
+          // Any other view with no back destination: swallow the
+          // press rather than exit unexpectedly.
+        })
+      } catch { /* App plugin unavailable: system back keeps its default behaviour */ }
+    })()
+    return () => { if (handle) handle.remove().catch(() => {}) }
+  }, [])
+  // Volume keys turn pages (native). A plain WebView keydown
+  // handler can NOT do this on Android: the system consumes the
+  // volume keys before the WebView ever sees them. So this uses
+  // @capawesome/capacitor-volume: startWatching installs a native
+  // key listener ONLY while watching, and with suppressVolumeChange
+  // it consumes the key (returns true), so the volume does not
+  // change and the system volume panel does not appear while
+  // reading. stopWatching removes the listener and restores normal
+  // volume behaviour. Listening starts on reader entry and stops
+  // on reader exit (or toggle off) — it never runs in Library,
+  // detail, or audio views, and never leaves a dangling listener.
+  // Volume DOWN = next page, Volume UP = previous page, through
+  // the same requestTurn path as swipe/buttons (one page per
+  // press — the plugin fires once per press, not on hold — with
+  // the same flip, haptic, and chapter-boundary rules).
+  useEffect(() => {
+    if (view !== 'reader' || !volumeKeysTurnPages) return
+    if (!Capacitor.isNativePlatform()) return
+    let cancelled = false
+    let handle = null
+    ;(async () => {
+      try {
+        handle = await Volume.addListener('volumeButtonPressed', (ev) => {
+          if (ev?.direction === 'down') nextPageRef.current?.()
+          else if (ev?.direction === 'up') prevPageRef.current?.()
+        })
+        if (cancelled) { try { await handle.remove() } catch { /* ignore */ } return }
+        await Volume.startWatching({ suppressVolumeChange: true })
+      } catch { /* plugin unavailable on this build: volume keys simply do nothing */ }
+    })()
+    return () => {
+      cancelled = true
+      const h = handle
+      handle = null
+      ;(async () => {
+        try { if (h) await h.remove() } catch { /* ignore */ }
+        try { await Volume.stopWatching() } catch { /* ignore */ }
+      })()
+    }
+  }, [view, volumeKeysTurnPages])
   function cancelFlipAnim() {
     if (flipAnimRef.current) { cancelAnimationFrame(flipAnimRef.current); flipAnimRef.current = null }
   }
@@ -936,6 +1132,7 @@ export default function App() {
   }
   function nextPage() { requestTurn(1) }
   function prevPage() { requestTurn(-1) }
+  useEffect(() => { nextPageRef.current = nextPage; prevPageRef.current = prevPage })
 
   // v0.7.0 pagination: measure the ACTUAL visible page area
   // (clientWidth/clientHeight via ResizeObserver + a measure on
@@ -1047,14 +1244,17 @@ export default function App() {
   function onReaderTouchStart(e) {
     cancelFlipAnim()
     const t = e.touches[0]
-    // Edge-origin: a touch starting within ~24px of the left screen
-    // edge is an EXIT candidate, not a page turn. Anything starting
-    // further right is a normal page-turn swipe, whatever direction
-    // it goes. The distinction is made HERE, at touch start — not by
-    // direction — so a rightward swipe from the middle of the page
-    // still turns to the previous page, and only an edge-origin
-    // rightward swipe exits.
-    readerTouch.current = { x: t.clientX, t: Date.now(), moved: false, edge: t.clientX <= 24 }
+    // In-app back band: a touch STARTING 56-160px from the left
+    // edge is an EXIT candidate, not a page turn. A touch starting
+    // in the system gesture zone (<~56px) is NOT an exit candidate
+    // — it is left to the system back gesture (see the backButton
+    // listener), so the Pixel can no longer steal/confuse it.
+    // Anything starting further right is a normal page-turn swipe,
+    // whatever direction it goes. The distinction is made HERE, at
+    // touch start — not by direction — so a rightward swipe from
+    // the middle of the page still turns to the previous page, and
+    // only a band-origin rightward swipe exits.
+    readerTouch.current = { x: t.clientX, t: Date.now(), moved: false, edge: t.clientX >= 56 && t.clientX <= 160 }
   }
   function onReaderTouchMove(e) {
     const d = readerTouch.current
@@ -1086,11 +1286,11 @@ export default function App() {
     const d = readerTouch.current
     readerTouch.current = null
     if (d && d.edge && d.moved) {
-      // Edge-origin rightward swipe: past ~80px (or 25% of the width)
+      // Band-origin rightward swipe: past ~80px (or 25% of the width)
       // it exits; otherwise it snaps back with no page change and
-      // no haptic. It never turns a page. (A plain tap on the edge
+      // no haptic. It never turns a page. (A plain tap in the band
       // is NOT a swipe: it falls through to the click handler and
-      // turns to the previous page as usual.)
+      // behaves as a normal tap.)
       const t = e.changedTouches[0]
       const dx = t.clientX - d.x
       const w = pageAreaRef.current ? pageAreaRef.current.clientWidth : 300
@@ -1126,12 +1326,14 @@ export default function App() {
   // is untouched. No preventDefault: the indicator follows the pull
   // and a release past the threshold reloads metadata from IndexedDB.
   function onPtrTouchStart(e) {
-    // Global edge swipe (all back-able views except the reader,
-    // which handles its own edge swipe on its page area): a touch
-    // starting within ~24px of the left edge is an EXIT candidate,
+    // Global back swipe (all back-able views except the reader,
+    // which handles its own band swipe on its page area): a touch
+    // STARTING 56-160px from the left edge is an EXIT candidate,
     // distinguished at touch start, not by direction — so a
     // rightward swipe from the middle of the page is NOT an exit.
-    if (view !== 'reader' && backDestinationFor(view) && e.touches[0].clientX <= 24) {
+    // The system gesture zone (<~56px) is left to the system back
+    // gesture, same as in the reader.
+    if (view !== 'reader' && backDestinationFor(view) && e.touches[0].clientX >= 56 && e.touches[0].clientX <= 160) {
       navEdgeRef.current = { x: e.touches[0].clientX, t: Date.now(), moved: false }
     }
     if (!['library', 'series', 'series-detail', 'unsorted'].includes(view)) return
@@ -1298,6 +1500,18 @@ export default function App() {
               ))}
             </div>
 
+            {scanOnStartup && watchedFolders.length > 0 && !watchPromptDismissed && (
+              <div className="card">
+                <p><strong>Watched folders saved:</strong> {watchedFolders.map((w) => w.name).join(', ')}.</p>
+                <p className="progress">Android does not let this app reopen a saved folder on its own. Tap Rescan to pick them again and import any new books.</p>
+                <div className="toolbar">
+                  <button onClick={() => { folderPickModeRef.current = 'rescan'; folderRef.current.click() }}>Rescan watched folders</button>
+                  <button className="secondary" onClick={() => setWatchPromptDismissed(true)}>Dismiss</button>
+                </div>
+                {watchStatus && <p className="progress">{watchStatus}</p>}
+              </div>
+            )}
+
             <div
               className={`dropzone ${drag ? 'drag' : ''}`}
               onDragOver={(e) => { e.preventDefault(); setDrag(true) }}
@@ -1311,8 +1525,8 @@ export default function App() {
                 <button className="secondary" onClick={() => folderRef.current.click()}>Choose a folder</button>
               </div>
               <input ref={fileRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden onChange={(e) => importFiles(e.target.files)} />
-              <input ref={folderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden
-                onChange={(e) => importFiles(e.target.files)} />
+              <input ref={folderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden webkitdirectory=""
+                onChange={(e) => { const mode = folderPickModeRef.current; folderPickModeRef.current = 'library'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
               <p className="progress">{importStatus}</p>
               {importErrors.length > 0 && (
                 <div className="error">
@@ -1422,7 +1636,36 @@ export default function App() {
                 {appTheme === 'dark' ? '☀️ Switch to light mode' : '🌙 Switch to dark mode'}
               </button>
               <p className="progress">Library view: {viewMode === 'list' ? 'List' : 'Grid'} — toggle it from the top bar in the Library.</p>
-              <p className="progress">ShelfSort v0.7.0</p>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={volumeKeysTurnPages} onChange={(e) => setVolumeKeysTurnPages(e.target.checked)} />
+                Volume keys turn pages (in the reader: volume down = next page, volume up = previous page; the volume itself does not change while reading)
+              </label>
+              <p className="progress">ShelfSort v0.7.1</p>
+            </div>
+            <div className="card">
+              <h2>Library folders (re-pick on each scan — Android does not let this app keep folder access between starts)</h2>
+              <p className="progress">Save a folder here and it will be listed below. On startup the app only reminds you to rescan — it cannot silently reopen a saved folder. Rescanning re-opens the phone's folder picker; you pick the folder again and only books not already in the library are imported. No file handles or folder access are stored, only the folder name.</p>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={scanOnStartup} onChange={(e) => setScanOnStartup(e.target.checked)} />
+                Scan watched folders on startup (show the rescan prompt in the Library)
+              </label>
+              <div className="toolbar">
+                <button onClick={() => watchFolderRef.current.click()}>Add folder</button>
+                <button className="secondary" disabled={!watchedFolders.length} onClick={() => { watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() }}>Rescan watched folders</button>
+              </div>
+              <input ref={watchFolderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden webkitdirectory=""
+                onChange={(e) => { const mode = watchPickModeRef.current; watchPickModeRef.current = 'add'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
+              {!watchedFolders.length ? (
+                <p className="progress">No watched folders yet. Add one with the button above.</p>
+              ) : (
+                watchedFolders.map((w) => (
+                  <div key={w.name} className="toolbar" style={{ justifyContent: 'space-between' }}>
+                    <span className="progress"><strong>{w.name}</strong>{w.lastCount !== undefined ? ` — ${w.lastCount} book file(s) found on last scan` : ''}</span>
+                    <button className="secondary" onClick={() => setWatchedFolders((prev) => prev.filter((x) => x.name !== w.name))}>Remove</button>
+                  </div>
+                ))
+              )}
+              {watchStatus && <p className="progress">{watchStatus}</p>}
             </div>
             <div className="card">
               <h2>Metadata fixes</h2>
@@ -1673,11 +1916,25 @@ export default function App() {
                     const targetPage = flip.boundary ? null : pages[pageIndex + flip.dir]
                     const angle = flip.dir > 0 ? -180 * flip.progress : 180 * flip.progress
                     const origin = flip.dir > 0 ? 'left center' : 'right center'
+                    const lift = Math.sin(Math.PI * flip.progress)
+                    // Curl-like fold: the fold line sweeps across the page
+                    // as the flip progresses — for a next turn it travels
+                    // right-to-left (fold at (1-progress)*100% from the
+                    // left), mirrored for a previous turn. Dark band at
+                    // the fold, light highlight just on the lifted side
+                    // of it. Single left-to-right gradient in both
+                    // directions so the stops stay monotonic.
+                    const foldPct = flip.dir > 0 ? (1 - flip.progress) * 100 : flip.progress * 100
+                    const foldBg = flip.dir > 0
+                      ? `linear-gradient(to right, rgba(0,0,0,0) ${Math.max(0, foldPct - 10)}%, rgba(0,0,0,0.5) ${foldPct}%, rgba(255,255,255,0.16) ${Math.min(100, foldPct + 6)}%, rgba(0,0,0,0) ${Math.min(100, foldPct + 14)}%)`
+                      : `linear-gradient(to right, rgba(0,0,0,0) ${Math.max(0, foldPct - 14)}%, rgba(255,255,255,0.16) ${Math.max(0, foldPct - 6)}%, rgba(0,0,0,0.5) ${foldPct}%, rgba(0,0,0,0) ${Math.min(100, foldPct + 10)}%)`
                     return (
                       <div className="reader-flip-stage">
                         <div className="reader-page reader-page-under" style={{ ['--reader-size']: `${fontSize}px` }} dangerouslySetInnerHTML={{ __html: targetPage ? targetPage.html : '' }} />
-                        <div className="reader-page reader-page-top" style={{ ['--reader-size']: `${fontSize}px`, transform: `rotateY(${angle}deg) scale(${1 - 0.03 * Math.sin(Math.PI * flip.progress)})`, transformOrigin: origin }} dangerouslySetInnerHTML={{ __html: cur.html }} />
-                        <div className="reader-flip-shadow" style={{ opacity: 0.55 * Math.sin(Math.PI * flip.progress), background: flip.dir > 0 ? 'linear-gradient(to left, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' : 'linear-gradient(to right, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' }} aria-hidden="true" />
+                        <div className="reader-flip-under-shadow" style={{ opacity: 0.35 * lift, background: flip.dir > 0 ? 'linear-gradient(to right, rgba(0,0,0,0.45), rgba(0,0,0,0) 55%)' : 'linear-gradient(to left, rgba(0,0,0,0.45), rgba(0,0,0,0) 55%)' }} aria-hidden="true" />
+                        <div className="reader-page reader-page-top" style={{ ['--reader-size']: `${fontSize}px`, transform: `rotateY(${angle}deg) scale(${1 - 0.03 * lift}) translateZ(${28 * lift}px)`, transformOrigin: origin }} dangerouslySetInnerHTML={{ __html: cur.html }} />
+                        <div className="reader-flip-fold" style={{ background: foldBg }} aria-hidden="true" />
+                        <div className="reader-flip-shadow" style={{ opacity: 0.55 * lift, background: flip.dir > 0 ? 'linear-gradient(to left, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' : 'linear-gradient(to right, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' }} aria-hidden="true" />
                       </div>
                     )
                   })()}

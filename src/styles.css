@@ -124,11 +124,27 @@ main.reader-main { padding: 0; max-width: none; }
    spine (left edge for next, right edge for previous) with a shadow
    that peaks mid-flip. Past 90deg the outgoing page is backface-
    hidden, so it reads as flipping over to reveal the next page.
-   Transform + opacity only, for phone performance. */
+   Transform + opacity only, for phone performance.
+   BUG FIX (v0.7.1): every page layer MUST be opaque in the current
+   theme. The theme background used to live only on .reader-screen,
+   so a transparent turning page let the under page's text show
+   straight through it, offset by the scale difference — double text
+   across the whole page mid-turn. With opaque page backgrounds the
+   under page is only visible where the top page has rotated away. */
 .reader-flip-stage { position: absolute; inset: 0; padding: 0 16px; transform-style: preserve-3d; }
 .reader-page-under { position: absolute; inset: 0; transform: scale(0.98); }
 .reader-page-top { position: absolute; inset: 0; backface-visibility: hidden; will-change: transform; }
+.reader-screen.light .reader-page { background: #fffdf8; color: #241f1a; }
+.reader-screen.dark .reader-page { background: #1e1e1e; color: #e8e8e8; }
+.reader-screen.sepia .reader-page { background: #f4ecd8; color: #433422; }
 .reader-flip-shadow { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+/* Curl-like fold: a dark fold line + light highlight that SWEEPS
+   across the page as the flip progresses (it is a sibling of the
+   turning page, not a child, so it does not rotate with it — the
+   fold travels, the way a paper curl's fold does). The shadow cast
+   onto the under page grows then shrinks with progress. */
+.reader-flip-fold { position: absolute; inset: 0; pointer-events: none; z-index: 3; }
+.reader-flip-under-shadow { position: absolute; inset: 0; pointer-events: none; z-index: 1; }
 .reader-measurer { position: absolute; left: -9999px; top: 0; visibility: hidden; pointer-events: none; }
 .reader-measurer .reader-page-measure { line-height: 1.7; overflow-wrap: break-word; word-break: break-word; }
 .reader-measurer .reader-page-measure img { max-width: 100%; height: auto; max-height: 100%; object-fit: contain; }
