@@ -94,46 +94,58 @@ main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; overflow-x: c
 .reader.dark { background: #1e1e1e; color: #e8e8e8; }
 .reader.sepia { background: #f4ecd8; color: #433422; }
 .reader .chapter { padding: 16px; border-radius: 12px; }
-/* EPUB page-turn layout (ReadEra-style): the chapter is laid out
-   in CSS columns, one column = one screen-sized page. The outer
-   area fills the viewport height minus the minimal header/footer,
-   not a small box. column-gap is 0 and translateX is in PIXELS
-   (pageIndex * measured pageWidth, see App.jsx), so pages never
-   drift or clip text at boundaries. While dragging, the transition
-   is off so the page follows the finger; on release it slides.
-   The reader article in ReadAlongView keeps the old scrolling
-   .chapter style above — pagination is EPUB-reader only. */
-.reader-full { max-width: 760px; margin: 0 auto; }
-.reader-minibar { flex-wrap: nowrap; }
-.reader-minibar .reader-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.reader-pages { overflow: hidden; height: calc(100dvh - 210px); min-height: 300px; touch-action: pan-y; padding: 0 16px; perspective: 1200px; }
-/* 3D page-turn: the flip wrapper carries rotateY/scale only (transform +
-   opacity on the shadow, nothing layout-affecting), while the inner
-   column strip keeps doing the pixel translateX pagination untouched.
-   This is a 3D flip, not a curved paper curl — a true curl is not
-   feasible with a CSS-column strip, so no curl is faked. */
-.reader-flip { position: relative; width: 100%; height: 100%; will-change: transform; transform-style: preserve-3d; }
-.reader-flip.turning-next { animation: reader-turn-next 0.25s ease; transform-origin: left center; }
-.reader-flip.turning-prev { animation: reader-turn-prev 0.25s ease; transform-origin: right center; }
-@keyframes reader-turn-next { 0% { transform: rotateY(0deg) scale(1); } 50% { transform: rotateY(-35deg) scale(0.97); } 100% { transform: rotateY(0deg) scale(1); } }
-@keyframes reader-turn-prev { 0% { transform: rotateY(0deg) scale(1); } 50% { transform: rotateY(35deg) scale(0.97); } 100% { transform: rotateY(0deg) scale(1); } }
-.reader-turn-shadow { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
-.reader-flip.turning-next .reader-turn-shadow, .reader-flip.turning-prev .reader-turn-shadow { animation: reader-shadow 0.25s ease forwards; }
-@keyframes reader-shadow { 0% { opacity: 0; } 50% { opacity: 0.45; } 100% { opacity: 0; } }
-.reader-column-flow { height: 100%; column-width: 100%; column-gap: 0; column-fill: auto; box-sizing: border-box; line-height: 1.7; font-size: var(--reader-size, 18px); padding: 0; will-change: transform; }
-.reader-column-flow img { max-width: 100%; height: auto; }
-/* Reader fit fix: strip padding MUST be 0 or pageWidth (clientWidth)
-   no longer equals the CSS column width. See comment above. */
-.reader .reader-column-flow.chapter { padding: 0; }
-/* Chapter content can never force a page wider than the screen:
-   fixed-width EPUB markup (wide images, tables, pre blocks, long
-   unbroken words) is clamped/wrapped inside the column. */
-.reader-column-flow, .viewer .chapter { overflow-wrap: break-word; word-break: break-word; }
-.reader-column-flow img, .reader-column-flow table, .reader-column-flow pre, .reader-column-flow svg, .reader-column-flow video, .reader-column-flow figure,
-.viewer .chapter img, .viewer .chapter table, .viewer .chapter pre, .viewer .chapter svg, .viewer .chapter video, .viewer .chapter figure { max-width: 100% !important; height: auto; box-sizing: border-box; }
-.reader-column-flow pre, .viewer .chapter pre { white-space: pre-wrap; overflow-x: clip; }
-.reader-column-flow table, .viewer .chapter table { table-layout: fixed; width: 100%; }
-.reader-pagebar { justify-content: space-between; align-items: center; }
+/* v0.7.0 EPUB reader — FULL SCREEN, real measured pages, NO CSS
+   columns. The old column strip (reader-column-flow / reader-pages /
+   reader-flip keyframes) is DELETED, not patched: it clipped text
+   when its scrollWidth measurement failed. The reader owns its whole
+   screen: the global top bar is hidden while reading (see App.jsx),
+   main has no padding in reader mode, and .reader-screen is exactly
+   100dvh — header (minimal) + page area (flex:1, the only thing that
+   grows) + footer (minimal). No black gap below, no content under
+   any bar, and the page-turn swipe is the only horizontal gesture
+   in the reader (touch-action: pan-y on the page area). */
+main.reader-main { padding: 0; max-width: none; }
+.reader-screen { height: 100dvh; display: flex; flex-direction: column; overflow: hidden; touch-action: pan-y; }
+.reader-screen.light { background: #fffdf8; color: #241f1a; }
+.reader-screen.dark { background: #1e1e1e; color: #e8e8e8; }
+.reader-screen.sepia { background: #f4ecd8; color: #433422; }
+.reader-header { flex-wrap: nowrap; margin: 0; padding: 8px 12px; }
+.reader-header .reader-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.reader-screen .toolbar { margin: 0; padding: 8px 12px; }
+.reader-page-area { flex: 1; min-height: 0; position: relative; overflow: hidden; touch-action: pan-y; perspective: 1400px; padding: 0 16px; }
+.reader-page { width: 100%; height: 100%; overflow: hidden; line-height: 1.7; font-size: var(--reader-size, 18px); overflow-wrap: break-word; word-break: break-word; }
+.reader-page p { margin: 0 0 1em; }
+.reader-page img, .reader-page table, .reader-page pre, .reader-page svg, .reader-page video, .reader-page figure { max-width: 100% !important; box-sizing: border-box; }
+.reader-page img { height: auto; max-height: 100%; object-fit: contain; }
+.reader-page pre { white-space: pre-wrap; overflow-x: clip; }
+.reader-page table { table-layout: fixed; width: 100%; }
+/* Full 3D flip: the incoming page sits underneath (slightly scaled),
+   the outgoing page rotates 0 -> 180deg in perspective around the
+   spine (left edge for next, right edge for previous) with a shadow
+   that peaks mid-flip. Past 90deg the outgoing page is backface-
+   hidden, so it reads as flipping over to reveal the next page.
+   Transform + opacity only, for phone performance. */
+.reader-flip-stage { position: absolute; inset: 0; padding: 0 16px; transform-style: preserve-3d; }
+.reader-page-under { position: absolute; inset: 0; transform: scale(0.98); }
+.reader-page-top { position: absolute; inset: 0; backface-visibility: hidden; will-change: transform; }
+.reader-flip-shadow { position: absolute; inset: 0; pointer-events: none; z-index: 2; }
+.reader-measurer { position: absolute; left: -9999px; top: 0; visibility: hidden; pointer-events: none; }
+.reader-measurer .reader-page-measure { line-height: 1.7; overflow-wrap: break-word; word-break: break-word; }
+.reader-measurer .reader-page-measure img { max-width: 100%; height: auto; max-height: 100%; object-fit: contain; }
+.reader-measurer .reader-page-measure pre { white-space: pre-wrap; }
+.reader-measurer .reader-page-measure table { table-layout: fixed; width: 100%; }
+/* Fallback (measurement failed): the whole chapter, scrollable.
+   This is the never-clip rule — overflow auto, never hidden. */
+.reader-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px; line-height: 1.7; font-size: var(--reader-size, 18px); overflow-wrap: break-word; word-break: break-word; }
+.reader-scroll img { max-width: 100%; height: auto; }
+.reader-footer { justify-content: space-between; align-items: center; }
+.reader { max-width: 760px; margin: 0 auto; }
+.reader .chapter { line-height: 1.7; font-size: var(--reader-size, 18px); }
+.reader .chapter img { max-width: 100%; height: auto; }
+.reader.light { background: #fffdf8; color: #241f1a; }
+.reader.dark { background: #1e1e1e; color: #e8e8e8; }
+.reader.sepia { background: #f4ecd8; color: #433422; }
+.reader .chapter { padding: 16px; border-radius: 12px; }
 /* Pull-to-refresh indicator (library + series views only). */
 .ptr { overflow: hidden; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px; transition: height 0.15s ease; }
 .viewer .chapter { line-height: 1.7; font-size: var(--reader-size, 18px); }

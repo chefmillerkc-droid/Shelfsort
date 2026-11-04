@@ -8,9 +8,12 @@ import { enrichBook } from './lib/enrich.js'
 import { groupBySeries, getSeries, sortBooks } from './lib/series.js'
 import { createAudioController } from './lib/nativeAudio.js'
 import { pageTurnHaptic } from './lib/haptics.js'
+import { paginateChapterDom, findPageForText, nextPageIndex } from './lib/paginate.js'
+import { cleanDescription } from './lib/description.js'
 import { storeAudioFile } from './lib/audioStore.js'
 import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
+import { exportCatalogFile } from './lib/catalogExport.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
@@ -90,11 +93,59 @@ export function progressFraction(book) {
 
 // List view (reference screenshot 1): cover left, title + author right,
 // thin progress bar under the cover. Nothing else on the card.
-function BookRow({ book, onOpen }) {
+// Tap vs long-press vs scroll, for book rows/cards.
+//   Tap (press + release, <500ms, <12px move)  -> onTap (open directly)
+//   Long-press (hold >=500ms, <12px move)      -> onDetail (detail page)
+//   Scroll (move >12px, any direction)          -> neither; the timer
+//     is cancelled on move, and a following click is swallowed, so a
+//     vertical list scroll can never open a book or its detail.
+// A long-press must NOT also fire the tap: when the timer fires it
+// sets fired=true, and the click that follows the release is
+// swallowed. Mouse holds work the same way (desktop fallback);
+// keyboard activation (Enter/Space) fires onTap with no press state.
+function usePressHandlers(onTap, onDetail) {
+  const timerRef = useRef(null)
+  const stRef = useRef({ x: 0, y: 0, fired: false, moved: false })
+  const clear = () => { if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null } }
+  const start = (x, y) => {
+    stRef.current = { x, y, fired: false, moved: false }
+    clear()
+    timerRef.current = setTimeout(() => { stRef.current.fired = true; onDetail() }, 500)
+  }
+  const move = (x, y) => {
+    const s = stRef.current
+    // Only during an active press: a plain mouse hover over a row
+    // must not arm the moved flag, or a later keyboard activation
+    // would be swallowed.
+    if (!s || (timerRef.current === null && !s.fired)) return
+    if (Math.hypot(x - s.x, y - s.y) > 12) { s.moved = true; clear() }
+  }
+  const end = () => clear()
+  const click = (e) => {
+    const s = stRef.current
+    if (s.fired || s.moved) { stRef.current = { x: 0, y: 0, fired: false, moved: false }; e.preventDefault(); return }
+    onTap()
+  }
+  return {
+    onTouchStart: (e) => start(e.touches[0].clientX, e.touches[0].clientY),
+    onTouchMove: (e) => move(e.touches[0].clientX, e.touches[0].clientY),
+    onTouchEnd: end,
+    onTouchCancel: end,
+    onMouseDown: (e) => start(e.clientX, e.clientY),
+    onMouseMove: (e) => move(e.clientX, e.clientY),
+    onMouseUp: end,
+    onMouseLeave: end,
+    onContextMenu: (e) => e.preventDefault(),
+    onClick: click,
+  }
+}
+
+function BookRow({ book, onOpen, onDetail }) {
   const cover = coverFor(book)
   const frac = progressFraction(book)
+  const press = usePressHandlers(() => onOpen(book), () => onDetail(book))
   return (
-    <button className="book-row" onClick={() => onOpen(book)}>
+    <button className="book-row" {...press}>
       <span className="row-cover">
         {cover ? <img src={cover} alt="" /> : <span className="cover">No cover</span>}
         <span className="row-progress"><span style={{ width: `${Math.round(frac * 100)}%` }} /></span>
@@ -109,20 +160,45 @@ function BookRow({ book, onOpen }) {
 
 // Grid view (reference screenshot 2): cover, with title + author under it,
 // small and muted so the cover stays the focus.
-function BookGridCard({ book, onOpen }) {
+function BookGridCard({ book, onOpen, onDetail }) {
   const cover = coverFor(book)
+  const press = usePressHandlers(() => onOpen(book), () => onDetail(book))
   return (
-    <button className="book-grid" onClick={() => onOpen(book)} aria-label={book.metadata.title}>
+    <button className="book-grid" {...press} aria-label={book.metadata.title}>
       {cover ? <img src={cover} alt="" /> : <div className="cover">No cover</div>}
       <span className="book-grid-title">{book.metadata.title}</span>
       <span className="book-grid-author">{book.metadata.author || 'Unknown author'}</span>
     </button>
   )
 }
-
 export default function App() {
   const [books, setBooks] = useState([])
   const [view, setView] = useState('library') // library | detail | reader | fixes | pdf | comic | audio | readalong
+  const viewRef = useRef(view)
+  useEffect(() => { viewRef.current = view }, [view])
+  // Back navigation, REPLACED by the left-edge swipe (see below).
+  // Every view that used to have an in-app Back button now exits by
+  // a swipe starting within ~24px of the left edge, moving right.
+  // Destination map — the same destination the old Back buttons had:
+  //   reader/detail/pdf/comic/audio/readalong -> detail/library as listed
+  // Top-bar Library/Series/Unsorted/Settings tabs and bottom format
+  // tabs are NOT back buttons and stay untouched.
+  function backDestinationFor(v) {
+    if (v === 'reader' || v === 'pdf' || v === 'comic' || v === 'audio' || v === 'readalong') return 'detail'
+    if (v === 'detail' || v === 'unsorted' || v === 'fixes' || v === 'cloud') return 'library'
+    if (v === 'series-detail') return 'series'
+    return null
+  }
+  // History entry for system back (see navigateBack / popstate).
+  const historyEntryRef = useRef(null) // { view } | null
+  const doExitReaderRef = useRef(null)
+  const navigateBackRef = useRef(null)
+  // Global (non-reader) edge swipe state: the reader has its own
+  // edge handling on its page area (with the flip), so the main
+  // handler below skips view === 'reader'.
+  const [navEdgeOffset, setNavEdgeOffset] = useState(0)
+  const navEdgeRef = useRef(null)
+  const navEdgeClickBlockRef = useRef(0)
   const [selected, setSelected] = useState(null)
   const [search, setSearch] = useState('')
   const [sortMode, setSortMode] = useState('series')
@@ -175,33 +251,38 @@ export default function App() {
   const [readerSearch, setReaderSearch] = useState('')
   const [readerHits, setReaderHits] = useState([])
   const [exporting, setExporting] = useState(false)
-  // EPUB pagination (page-turn, not scroll). pageCount is measured
-  // from the CSS-column layout (see the repaginate effect below);
-  // pageIndexRef mirrors pageIndex without re-running that effect.
+  // EPUB reader v0.7.0 — REAL pages, measured, no CSS columns.
+  // `pages` is the current chapter split into page divs by
+  // paginateChapterDom (each page's blocks, measured to fit the
+  // actual page area). pageIndexRef mirrors pageIndex. If pagination
+  // fails, readerFallback is true and the whole chapter is shown
+  // scrollable — text is NEVER clipped with no way to reach it.
   const [pageIndex, setPageIndex] = useState(0)
   const [pageCount, setPageCount] = useState(1)
-  const pageRef = useRef(null)
+  const [pages, setPages] = useState([])
+  const [readerFallback, setReaderFallback] = useState(false)
   const pageIndexRef = useRef(0)
   const pageCountRef = useRef(1)
-  const pagePendingRef = useRef(null) // 'last' | fraction 0..1 | null
-  // ReadEra-style page turning: dragOffset follows the finger live
-  // (px), dragging disables the slide transition; pageWidth is the
-  // measured pixel width of one column, so translateX is in px, not %.
-  const [dragOffset, setDragOffset] = useState(0)
-  const [dragging, setDragging] = useState(false)
-  // 3D page-turn: a transient snap animation (next/prev) applied to the
-  // flip wrapper below. During a drag, the tilt is driven directly
-  // from dragOffset (see the reader JSX); during a tap/button turn,
-  // this keyframed animation peaks mid-turn and settles back to 0.
-  // It never touches pagination — pageIndex/pageCount are unchanged.
-  const [turnAnim, setTurnAnim] = useState(null) // { dir: 1 next | -1 prev, key } | null
-  const turnAnimTimeoutRef = useRef(null)
-  function startTurnAnim(dir) {
-    if (turnAnimTimeoutRef.current) clearTimeout(turnAnimTimeoutRef.current)
-    setTurnAnim({ dir, key: Date.now() })
-    turnAnimTimeoutRef.current = setTimeout(() => setTurnAnim(null), 260)
-  }
-  const [pageWidth, setPageWidth] = useState(0)
+  const pagePendingRef = useRef(null) // 'last' | { frac } | { page } | null
+  const pageAreaRef = useRef(null)
+  const measurerRef = useRef(null)
+  const pageAreaSizeRef = useRef({ w: 0, h: 0 })
+  // Full 3D page-turn: during a drag or an animated turn, the reader
+  // renders TWO layers — the incoming page underneath, and the
+  // outgoing page on top rotating in perspective (0 -> 180deg, pivot
+  // on the spine: left edge for next, right edge for prev, with a
+  // shadow that grows with progress). Past 90deg the outgoing page
+  // is backface-hidden, so it reads as flipping over to reveal the
+  // next page — not a tilt on a sliding page. flip = null when idle.
+  const [flip, setFlip] = useState(null) // { dir, progress, target, boundary }
+  // Left-edge exit swipe: a rightward swipe STARTING within ~24px of
+  // the left edge exits the reader (see onReaderTouch*). edgeOffset
+  // is the live drag distance, applied as a translateX on the reader
+  // screen so the exit follows the finger like the flip does.
+  const [edgeOffset, setEdgeOffset] = useState(0)
+  const flipRef = useRef(null)
+  const flipAnimRef = useRef(null)
+  function setFlipState(f) { flipRef.current = f; setFlip(f) }
   const [readerToolbar, setReaderToolbar] = useState(false)
   const dragRef = useRef(null)
   const suppressClickRef = useRef(false)
@@ -465,10 +546,21 @@ export default function App() {
   }
 
   // ---- Muse catalog export / import ------------------------------------
-  function exportCatalog() {
+  async function exportCatalog() {
     const catalog = buildCatalog(books)
-    downloadBlob(new Blob([JSON.stringify(catalog, null, 2)], { type: 'application/json' }), 'shelfsort-catalog.json')
-    setCatalogStatus(`Exported ${catalog.books.length} book${catalog.books.length === 1 ? '' : 's'} — metadata only, no book files, covers, or credentials. Share this file when you want the catalog sorted, then import the corrected file back.`)
+    const jsonText = JSON.stringify(catalog, null, 2)
+    const countNote = `${catalog.books.length} book${catalog.books.length === 1 ? '' : 's'} — metadata only, no book files, covers, or credentials.`
+    try {
+      const result = await exportCatalogFile(jsonText)
+      // exportCatalogFile already distinguishes success, a dismissed
+      // share sheet, and a real failure — never claim an export that
+      // did not produce a file (the old "Exported N books" message
+      // did exactly that on Android, where the blob download was
+      // silently swallowed and no file ever appeared).
+      setCatalogStatus(result.ok ? `${result.detail} ${countNote}` : result.detail)
+    } catch (e) {
+      setCatalogStatus(`No catalog file was created: ${e && e.message ? e.message : 'unknown error'}. Nothing was exported — try Export again.`)
+    }
   }
 
   async function previewCatalogFile(file) {
@@ -637,8 +729,24 @@ export default function App() {
   // ---- Openers ---------------------------------------------------------
   async function openBook(book) {
     // Detail page needs metadata only — no file blob is loaded here.
+    // Reached ONLY by long-press now (see BookRow/BookGridCard).
     setSelected(book)
     setView('detail')
+  }
+
+  // Tap on a row/card opens the book DIRECTLY — no detail page in
+  // between — exactly as the old Read/Play buttons did. CBR cannot
+  // open at all, so it falls back to the detail page, which is the
+  // only place that explains the CBR limitation.
+  async function openDirect(book) {
+    if (book.format === 'epub') return openReader(book)
+    if (book.format === 'pdf') return openViewer(book, 'pdf')
+    if (book.format === 'comic') {
+      if (book.cbrUnsupported) return openBook(book)
+      return openViewer(book, 'comic')
+    }
+    if (book.format === 'audio') return openViewer(book, 'audio')
+    return openBook(book)
   }
 
   async function openReader(book) {
@@ -703,137 +811,309 @@ export default function App() {
     setBooks((prev) => prev.map((b) => (b.id === book.id ? updated : b)))
   }
 
-  // Page-turn navigation. Next on the last page of a chapter moves
-  // to the next chapter's first page; previous on the first page
-  // moves to the previous chapter's LAST page (via pagePendingRef,
-  // applied once that chapter has been repaginated).
-  function nextPage() {
-    if (pageIndexRef.current < pageCountRef.current - 1) {
-      startTurnAnim(1)
-      pageTurnHaptic('light')
-      const p = pageIndexRef.current + 1
+  // v0.7.0 page turning — ONE page per turn, always.
+  // nextPageIndex() (paginate.js) is the rule: a turn moves exactly
+  // one page within the chapter; ONLY on the last page does it move
+  // to the next chapter (and symmetrically on the first page to the
+  // previous chapter's last page). A chapter measured as 1 page used
+  // to make every swipe jump a chapter — with real measured pages
+  // that cannot happen: a multi-page chapter needs N-1 turns to
+  // reach its last page. The turn itself is a full 3D flip (see the
+  // reader JSX): the outgoing page rotates 0 -> 180deg in
+  // perspective over the incoming page underneath, following the
+  // finger during a drag and snapping forward/back on release.
+  function commitTurn(dir) {
+    const r = nextPageIndex(pageIndexRef.current, pageCountRef.current, dir)
+    if (!r.chapterChange) {
+      const p = r.page
       pageIndexRef.current = p
       setPageIndex(p)
       if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
-    } else if (chapterIndex < chapters.length - 1) {
-      startTurnAnim(1)
-      pageTurnHaptic('medium')
+      return
+    }
+    if (dir > 0 && chapterIndex < chapters.length - 1) {
       pagePendingRef.current = null
       goToChapter(selected, chapterIndex + 1, chapters.length, 0)
-    } else if (selected) {
-      saveReaderPage(selected, chapterIndex, pageIndexRef.current, pageCountRef.current, chapters.length)
-    }
-  }
-
-  function prevPage() {
-    if (pageIndexRef.current > 0) {
-      startTurnAnim(-1)
-      pageTurnHaptic('light')
-      const p = pageIndexRef.current - 1
-      pageIndexRef.current = p
-      setPageIndex(p)
-      if (selected) saveReaderPage(selected, chapterIndex, p, pageCountRef.current, chapters.length)
-    } else if (chapterIndex > 0) {
-      startTurnAnim(-1)
-      pageTurnHaptic('medium')
+    } else if (dir < 0 && chapterIndex > 0) {
       pagePendingRef.current = 'last'
       goToChapter(selected, chapterIndex - 1, chapters.length, 0)
     }
   }
+  // Exit the reader to the book's detail page, saving progress
+  // first — exactly what the Back button does. doExitReader is the
+  // plain version; exitReader goes through browser history when the
+  // reader pushed an entry, so a system back press and an in-app
+  // exit stay in sync (see the popstate effect below).
+  function doExitReader() {
+    if (selected && !readerFallback) saveReaderPage(selected, chapterIndex, pageIndexRef.current, pageCountRef.current, chapters.length)
+    setEdgeOffset(0)
+    cancelFlipAnim()
+    setFlipState(null)
+    setView('detail')
+  }
+  useEffect(() => { doExitReaderRef.current = doExitReader })
+  function exitReader() {
+    if (historyEntryRef.current && historyEntryRef.current.view === 'reader') { historyEntryRef.current = null; window.history.back() }
+    else doExitReader()
+  }
+  // System back (Android back button/gesture, browser back):
+  // every back-able view pushes a history entry on entry, so a
+  // system back pops that entry and lands on the same destination
+  // the old Back button had — the user is never stuck if an edge
+  // swipe misses. Reader exit also saves progress (doExitReader).
+  function navigateBack(v) {
+    const dest = backDestinationFor(v)
+    if (!dest) return
+    if (v === 'reader') { exitReader(); return }
+    if (historyEntryRef.current && historyEntryRef.current.view === v) { historyEntryRef.current = null; window.history.back() }
+    else setView(dest)
+  }
+  useEffect(() => { navigateBackRef.current = navigateBack })
+  useEffect(() => {
+    const onPop = () => {
+      const v = viewRef.current
+      historyEntryRef.current = null
+      if (v === 'reader') {
+        if (doExitReaderRef.current) doExitReaderRef.current()
+      } else {
+        const dest = backDestinationFor(v)
+        if (dest) setView(dest)
+      }
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+  // Desktop fallback (no touch, no Back button left): Escape exits
+  // the current back-able view to the same destination. Browser back
+  // and the top-bar tabs also still work.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape' && navigateBackRef.current) navigateBackRef.current(viewRef.current)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+  function cancelFlipAnim() {
+    if (flipAnimRef.current) { cancelAnimationFrame(flipAnimRef.current); flipAnimRef.current = null }
+  }
+  // Animate a flip from its current progress to `to` (0 = snap back,
+  // 1 = complete), then either commit the turn or cancel it. The
+  // haptic fires ONLY on a completed turn: light for a page,
+  // medium for a chapter change — never on a snap-back.
+  function animateFlipTo(to, dir, boundary) {
+    cancelFlipAnim()
+    const from = flipRef.current ? flipRef.current.progress : 0
+    const start = performance.now()
+    const dur = 280
+    const step = (now) => {
+      const k = Math.min(1, (now - start) / dur)
+      const eased = 1 - Math.pow(1 - k, 3)
+      const progress = from + (to - from) * eased
+      if (k < 1) {
+        setFlipState({ dir, progress, boundary })
+        flipAnimRef.current = requestAnimationFrame(step)
+      } else if (to >= 1) {
+        setFlipState(null)
+        if (boundary) pageTurnHaptic('medium')
+        else pageTurnHaptic('light')
+        commitTurn(dir)
+      } else {
+        setFlipState(null)
+      }
+    }
+    flipAnimRef.current = requestAnimationFrame(step)
+  }
+  function requestTurn(dir) {
+    if (readerFallback || flipRef.current || !chapters.length) return
+    const r = nextPageIndex(pageIndexRef.current, pageCountRef.current, dir)
+    const boundary = r.chapterChange && (
+      (dir > 0 && chapterIndex < chapters.length - 1) ||
+      (dir < 0 && chapterIndex > 0)
+    )
+    if (r.chapterChange && !boundary) return // at the very start/end of the book
+    setFlipState({ dir, progress: 0, boundary })
+    animateFlipTo(1, dir, boundary)
+  }
+  function nextPage() { requestTurn(1) }
+  function prevPage() { requestTurn(-1) }
 
-  // Repaginate the current chapter after it renders, and whenever
-  // the font size or viewport changes. The chapter content is laid
-  // out in CSS columns (one column = one screen-sized page, see
-  // styles.css .reader-column-flow); page count comes from the
-  // measured scroll width, so it follows font size and viewport
-  // instead of guessing from character counts.
+  // v0.7.0 pagination: measure the ACTUAL visible page area
+  // (clientWidth/clientHeight via ResizeObserver + a measure on
+  // mount), split the chapter into real pages with
+  // paginateChapterDom, and show one page div. Re-paginates
+  // (debounced) on font-size, theme, chapter, and container resize.
+  // If measurement fails or returns 0, readerFallback is set and the
+  // whole chapter renders scrollable — never clipped, never lost.
+  useEffect(() => {
+    if (backDestinationFor(view) && (!historyEntryRef.current || historyEntryRef.current.view !== view)) {
+      try { window.history.pushState({ shelfsortBack: view }, '') } catch { /* history unavailable */ }
+      historyEntryRef.current = { view }
+    }
+  }, [view])
+  useEffect(() => {
+    if (view !== 'reader') return
+    window.scrollTo(0, 0)
+    if (!historyEntryRef.current || historyEntryRef.current.view !== 'reader') {
+      try { window.history.pushState({ shelfsortReader: true }, '') } catch { /* history unavailable: in-app exit still works */ }
+      historyEntryRef.current = { view: 'reader' }
+    }
+  }, [view])
   useEffect(() => {
     if (view !== 'reader' || !chapters.length) return
     let cancelled = false
-    const measure = () => {
+    let timer = null
+    const doPaginate = () => {
       if (cancelled) return
-      const el = pageRef.current
-      if (!el || !el.clientWidth) return
-      // column-gap is 0 AND strip padding is forced to 0 (styles.css
-      // .reader .reader-column-flow.chapter beats .reader .chapter's
-      // 16px padding), so one page = one clientWidth in pixels, with
-      // no drift or clipped text at boundaries. The 16px visual inset
-      // lives on the outer .reader-pages container instead.
-      const count = Math.max(1, Math.round(el.scrollWidth / el.clientWidth))
-      if (el.clientWidth !== pageWidth) setPageWidth(el.clientWidth)
-      const fontChanged = prevReaderFontRef.current !== fontSize
-      const chapterChanged = prevReaderChapterRef.current !== chapterIndex
-      prevReaderFontRef.current = fontSize
-      prevReaderChapterRef.current = chapterIndex
-      let p = pageIndexRef.current
-      if (pagePendingRef.current === 'last') p = count - 1
-      else if (typeof pagePendingRef.current === 'number') p = Math.min(count - 1, Math.max(0, Math.floor(pagePendingRef.current * count)))
-      else if (fontChanged && pageCountRef.current > 1) p = Math.min(count - 1, Math.max(0, Math.round((pageIndexRef.current / pageCountRef.current) * count)))
-      else p = Math.min(count - 1, Math.max(0, p))
-      pagePendingRef.current = null
-      const oldCount = pageCountRef.current
-      pageCountRef.current = count
-      setPageCount(count)
-      if (p !== pageIndexRef.current || count !== oldCount) {
-        pageIndexRef.current = p
-        setPageIndex(p)
-        if (selected && (p !== (selected.progress?.page || 0) || chapterChanged)) {
-          saveReaderPage(selected, chapterIndex, p, count, chapters.length)
+      const area = pageAreaRef.current
+      const measurer = measurerRef.current
+      const html = chapters[chapterIndex]?.html || ''
+      const w = area ? area.clientWidth : 0
+      const h = area ? area.clientHeight : 0
+      if (!w || !h || !measurer) {
+        // No size yet (first paint): retry once, then fall back.
+        if (!area || !measurer) return
+        setReaderFallback(true)
+        setPages([{ html, text: '' }])
+        setPageCount(1)
+        pageCountRef.current = 1
+        return
+      }
+      pageAreaSizeRef.current = { w, h }
+      // Style the measurer exactly like a visible page so measured
+      // heights match rendered heights. The page area has 16px
+      // padding on each side, so the page content width is the area
+      // width minus 32 — the measurer is sized to that, not to the
+      // full area width, or every page would be measured 32px too
+      // wide (the old reader's drift bug, in a new form).
+      measurer.style.width = `${Math.max(1, w - 32)}px`
+      measurer.style.fontSize = `${fontSize}px`
+      try {
+        const newPages = paginateChapterDom(html, measurer, h)
+        const count = Math.max(1, newPages.length)
+        const fontChanged = prevReaderFontRef.current !== fontSize
+        const chapterChanged = prevReaderChapterRef.current !== chapterIndex
+        prevReaderFontRef.current = fontSize
+        prevReaderChapterRef.current = chapterIndex
+        let p = pageIndexRef.current
+        if (pagePendingRef.current === 'last') p = count - 1
+        else if (pagePendingRef.current && typeof pagePendingRef.current === 'object' && pagePendingRef.current.page != null) p = Math.min(count - 1, Math.max(0, pagePendingRef.current.page))
+        else if (pagePendingRef.current && typeof pagePendingRef.current === 'object' && pagePendingRef.current.frac != null) p = Math.min(count - 1, Math.max(0, Math.floor(pagePendingRef.current.frac * count)))
+        else if (fontChanged && pageCountRef.current > 1) p = Math.min(count - 1, Math.max(0, Math.round((pageIndexRef.current / pageCountRef.current) * count)))
+        else p = Math.min(count - 1, Math.max(0, p))
+        pagePendingRef.current = null
+        const oldCount = pageCountRef.current
+        setReaderFallback(false)
+        setPages(newPages)
+        pageCountRef.current = count
+        setPageCount(count)
+        if (p !== pageIndexRef.current || count !== oldCount) {
+          pageIndexRef.current = p
+          setPageIndex(p)
+          if (selected && (p !== (selected.progress?.page || 0) || chapterChanged)) {
+            saveReaderPage(selected, chapterIndex, p, count, chapters.length)
+          }
         }
+      } catch (e) {
+        // Measurement failed: scrollable whole chapter, never clip.
+        setReaderFallback(true)
+        setPages([{ html, text: '' }])
+        setPageCount(1)
+        pageCountRef.current = 1
       }
     }
-    const t1 = requestAnimationFrame(() => { const t2 = setTimeout(measure, 60); return t2 })
-    const onResize = () => measure()
-    window.addEventListener('resize', onResize)
-    return () => { cancelled = true; cancelAnimationFrame(t1); window.removeEventListener('resize', onResize) }
+    const schedule = () => { if (timer) clearTimeout(timer); timer = setTimeout(doPaginate, 120) }
+    const raf = requestAnimationFrame(() => { const t = setTimeout(doPaginate, 30); return t })
+    let ro = null
+    if (typeof ResizeObserver !== 'undefined' && pageAreaRef.current) {
+      ro = new ResizeObserver(() => {
+        const a = pageAreaRef.current
+        if (!a) return
+        const s = pageAreaSizeRef.current
+        if (Math.abs(a.clientWidth - s.w) > 2 || Math.abs(a.clientHeight - s.h) > 2) schedule()
+      })
+      ro.observe(pageAreaRef.current)
+    }
+    window.addEventListener('resize', schedule)
+    return () => { cancelled = true; cancelAnimationFrame(raf); if (timer) clearTimeout(timer); if (ro) ro.disconnect(); window.removeEventListener('resize', schedule) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, chapterIndex, chapters, fontSize])
+  }, [view, chapterIndex, chapters, fontSize, readerTheme])
 
-  // ReadEra-style page turning on the page area. The swipe FOLLOWS
-  // the finger: touchmove applies the drag offset live (px), and on
-  // release the page snaps to next/previous when the drag passes
-  // ~25% of the page width or is a fast flick, otherwise snaps back.
-  // A tap on the left/right thirds still turns a page; a tap in the
-  // middle toggles the toolbar. The click that follows a swipe is
-  // suppressed, so a page never turns twice for one gesture.
+  // Full 3D flip drag: the flip follows the finger. Dragging left
+  // turns forward, right turns back; progress = |dx| / page width.
+  // On release, past ~25% width or a fast flick completes the flip
+  // (and the turn); otherwise it snaps back with no page change and
+  // no haptic. A tap (no drag) is handled by onReaderClick.
   const readerTouch = useRef(null)
   function onReaderTouchStart(e) {
+    cancelFlipAnim()
     const t = e.touches[0]
-    readerTouch.current = { x: t.clientX, y: t.clientY, t: Date.now() }
-    dragRef.current = { x: t.clientX, t: Date.now(), moved: false }
+    // Edge-origin: a touch starting within ~24px of the left screen
+    // edge is an EXIT candidate, not a page turn. Anything starting
+    // further right is a normal page-turn swipe, whatever direction
+    // it goes. The distinction is made HERE, at touch start — not by
+    // direction — so a rightward swipe from the middle of the page
+    // still turns to the previous page, and only an edge-origin
+    // rightward swipe exits.
+    readerTouch.current = { x: t.clientX, t: Date.now(), moved: false, edge: t.clientX <= 24 }
   }
   function onReaderTouchMove(e) {
-    const d = dragRef.current
-    if (!d) return
+    const d = readerTouch.current
+    if (!d || readerFallback || !chapters.length) return
     const t = e.touches[0]
     const dx = t.clientX - d.x
+    const w = pageAreaRef.current ? pageAreaRef.current.clientWidth : 300
+    if (d.edge && dx > 8) {
+      // Edge-origin rightward drag: follow the finger as an exit
+      // drag, and do NOT start a page flip at all.
+      setEdgeOffset(Math.min(dx, w * 0.9))
+      d.moved = true
+      return
+    }
+    if (d.edge && dx < 0) d.edge = false // edge-origin LEFT swipe is a normal next-page turn
     if (Math.abs(dx) > 8) {
       d.moved = true
-      setDragging(true)
-      // Clamp the live offset so a drag cannot jump past one page.
-      const w = pageWidth || e.currentTarget.clientWidth || 300
-      setDragOffset(Math.max(-w, Math.min(w, dx)))
+      const dir = dx < 0 ? 1 : -1
+      const r = nextPageIndex(pageIndexRef.current, pageCountRef.current, dir)
+      const boundary = r.chapterChange && (
+        (dir > 0 && chapterIndex < chapters.length - 1) ||
+        (dir < 0 && chapterIndex > 0)
+      )
+      if (r.chapterChange && !boundary) return // book edge: no flip, no turn
+      setFlipState({ dir, progress: Math.min(1, Math.abs(dx) / w), boundary })
     }
   }
   function onReaderTouchEnd(e) {
-    const d = dragRef.current
-    dragRef.current = null
-    setDragging(false)
-    setDragOffset(0)
-    if (!d || !d.moved) return
+    const d = readerTouch.current
+    readerTouch.current = null
+    if (d && d.edge && d.moved) {
+      // Edge-origin rightward swipe: past ~80px (or 25% of the width)
+      // it exits; otherwise it snaps back with no page change and
+      // no haptic. It never turns a page. (A plain tap on the edge
+      // is NOT a swipe: it falls through to the click handler and
+      // turns to the previous page as usual.)
+      const t = e.changedTouches[0]
+      const dx = t.clientX - d.x
+      const w = pageAreaRef.current ? pageAreaRef.current.clientWidth : 300
+      suppressClickRef.current = true
+      if (dx > 80 || dx > w * 0.25) exitReader()
+      else setEdgeOffset(0)
+      return
+    }
+    const f = flipRef.current
+    if (!d || !d.moved || !f) return
     suppressClickRef.current = true
     const t = e.changedTouches[0]
     const dx = t.clientX - d.x
     const dt = Math.max(1, Date.now() - d.t)
-    const w = pageWidth || 300
+    const w = pageAreaRef.current ? pageAreaRef.current.clientWidth : 300
     const flick = Math.abs(dx) > 50 && (Math.abs(dx) / dt) > 0.5 // px/ms
-    if (dx < -w * 0.25 || (dx < 0 && flick)) nextPage()
-    else if (dx > w * 0.25 || (dx > 0 && flick)) prevPage()
-    // else: snap back (dragOffset reset above restores the page)
+    if (Math.abs(dx) > w * 0.25 || flick) animateFlipTo(1, f.dir, f.boundary)
+    else animateFlipTo(0, f.dir, f.boundary)
   }
   function onReaderClick(e) {
     if (suppressClickRef.current) { suppressClickRef.current = false; return }
     if (e.target && e.target.closest && e.target.closest('a,button,input,select,textarea,label')) return
+    if (readerFallback) return
     const rect = e.currentTarget.getBoundingClientRect()
     const frac = (e.clientX - rect.left) / Math.max(1, rect.width)
     if (frac < 0.3) prevPage()
@@ -846,18 +1126,47 @@ export default function App() {
   // is untouched. No preventDefault: the indicator follows the pull
   // and a release past the threshold reloads metadata from IndexedDB.
   function onPtrTouchStart(e) {
+    // Global edge swipe (all back-able views except the reader,
+    // which handles its own edge swipe on its page area): a touch
+    // starting within ~24px of the left edge is an EXIT candidate,
+    // distinguished at touch start, not by direction — so a
+    // rightward swipe from the middle of the page is NOT an exit.
+    if (view !== 'reader' && backDestinationFor(view) && e.touches[0].clientX <= 24) {
+      navEdgeRef.current = { x: e.touches[0].clientX, t: Date.now(), moved: false }
+    }
     if (!['library', 'series', 'series-detail', 'unsorted'].includes(view)) return
     if (window.scrollY > 0) return
     ptrStartY.current = e.touches[0].clientY
   }
   function onPtrTouchMove(e) {
+    const ne = navEdgeRef.current
+    if (ne) {
+      const dx = e.touches[0].clientX - ne.x
+      if (dx > 8) {
+        ne.moved = true
+        const w = window.innerWidth || 300
+        setNavEdgeOffset(Math.min(dx, w * 0.9))
+        return
+      }
+      if (dx < -8) navEdgeRef.current = null // edge-origin LEFT drag is not an exit
+    }
     if (ptrStartY.current == null || ptrRefreshing) return
     const dy = e.touches[0].clientY - ptrStartY.current
     const d = dy > 0 ? Math.min(dy, 90) : 0
     pullDistRef.current = d
     setPullDist(d)
   }
-  async function onPtrTouchEnd() {
+  async function onPtrTouchEnd(e) {
+    const ne = navEdgeRef.current
+    navEdgeRef.current = null
+    if (ne && ne.moved) {
+      const dx = e && e.changedTouches ? e.changedTouches[0].clientX - ne.x : 0
+      const w = window.innerWidth || 300
+      navEdgeClickBlockRef.current = Date.now()
+      if (dx > 80 || dx > w * 0.25) { setNavEdgeOffset(0); navigateBack(view); return }
+      setNavEdgeOffset(0)
+      return
+    }
     const d = pullDistRef.current
     ptrStartY.current = null
     pullDistRef.current = 0
@@ -897,11 +1206,12 @@ export default function App() {
     chapters.forEach((ch, i) => {
       const idx = ch.text.toLowerCase().indexOf(q)
       if (idx >= 0) {
-        // frac is a page estimate: columns fill in order, so the
-        // character position within the chapter approximates the
-        // page. The repaginate effect applies it once the target
-        // chapter has been laid out (see pagePendingRef).
-        hits.push({ chapter: i, title: ch.title, snippet: ch.text.slice(Math.max(0, idx - 60), idx + 120), frac: idx / Math.max(1, ch.text.length) })
+        // For the current chapter the hit jumps to its ACTUAL page
+        // (pages are real page divs, so the page is looked up, not
+        // estimated). For other chapters the fraction is converted
+        // to a real page once that chapter is paginated.
+        const page = i === chapterIndex && pages.length ? findPageForText(pages, q) : -1
+        hits.push({ chapter: i, title: ch.title, snippet: ch.text.slice(Math.max(0, idx - 60), idx + 120), page: page >= 0 ? page : null, frac: idx / Math.max(1, ch.text.length) })
       }
     })
     setReaderHits(hits)
@@ -944,30 +1254,13 @@ export default function App() {
   }, [books, search, formatTab])
   const seriesGroups = useMemo(() => groupBySeries(seriesBase), [seriesBase])
   const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'fixes' ? 'Fix Review' : 'Library'
-  // 3D page-turn values, derived from the existing drag state (no new
-  // renders beyond the drag itself). While dragging, the flip wrapper
-  // tilts up to ~35deg in the turn direction and dips to 0.97 scale,
-  // with a shadow that darkens with progress; on release / tap the
-  // CSS snap animation (turnAnim class) takes over and settles to 0.
-  const turnW = pageWidth || 300
-  const turnProgress = dragging ? Math.min(1, Math.abs(dragOffset) / turnW) : 0
-  const turnDir = dragOffset < 0 ? 1 : -1 // 1 = next page, -1 = previous
-  const flipStyle = dragging && dragOffset !== 0
-    ? { transform: `rotateY(${turnDir > 0 ? -35 * turnProgress : 35 * turnProgress}deg) scale(${1 - 0.03 * turnProgress})`, transformOrigin: turnDir > 0 ? 'left center' : 'right center' }
-    : {}
-  const flipShadowStyle = {
-    opacity: dragging ? 0.45 * turnProgress : 0,
-    background: turnDir > 0
-      ? 'linear-gradient(to left, rgba(0,0,0,0.55), rgba(0,0,0,0) 60%)'
-      : 'linear-gradient(to right, rgba(0,0,0,0.55), rgba(0,0,0,0) 60%)',
-  }
   const detail = selected && books.find((b) => b.id === selected.id)
   const detailPair = detail ? linkedPairFor(detail) : null
   const detailAuto = detail ? autoMatchFor(detail) : null
 
   return (
     <>
-      <header className="topbar">
+      {view !== 'reader' && <header className="topbar">
         <h1>{headerTitle}</h1>
         <div className="topbar-actions">
           <button className="icon-btn" onClick={() => setSearchOpen(!searchOpen)} aria-label="Search">🔍</button>
@@ -987,9 +1280,9 @@ export default function App() {
         {searchOpen && (
           <input className="top-search" type="search" placeholder="Search title, author, or series…" value={search} onChange={(e) => setSearch(e.target.value)} autoFocus />
         )}
-      </header>
+      </header>}
 
-      <main onTouchStart={onPtrTouchStart} onTouchMove={onPtrTouchMove} onTouchEnd={onPtrTouchEnd}>
+      <main className={view === 'reader' ? 'reader-main' : ''} style={navEdgeOffset ? { transform: `translateX(${navEdgeOffset}px)` } : undefined} onTouchStart={onPtrTouchStart} onTouchMove={onPtrTouchMove} onTouchEnd={onPtrTouchEnd} onClickCapture={(e) => { if (Date.now() - navEdgeClickBlockRef.current < 300) { e.preventDefault(); e.stopPropagation() } }}>
         {['library', 'series', 'series-detail', 'unsorted'].includes(view) && (pullDist > 0 || ptrRefreshing) && (
           <div className="ptr" style={{ height: ptrRefreshing ? 48 : pullDist }}>
             {ptrRefreshing ? 'Refreshing…' : (pullDist >= 70 ? 'Release to refresh' : 'Pull to refresh')}
@@ -1055,11 +1348,11 @@ export default function App() {
               <div className="card"><p>No books match this filter.</p></div>
             ) : viewMode === 'grid' ? (
               <div className="book-grid-wrap">
-                {filtered.map((b) => <BookGridCard key={b.id} book={b} onOpen={openBook} />)}
+                {filtered.map((b) => <BookGridCard key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
               </div>
             ) : (
               <div className="book-list">
-                {filtered.map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
+                {filtered.map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
               </div>
             )}
           </>
@@ -1087,13 +1380,12 @@ export default function App() {
 
         {view === 'series-detail' && seriesDetail && (
           <div>
-            <button className="secondary" onClick={() => setView('series')}>← Back to Series</button>
             <h2>{seriesDetail.name}</h2>
             {seriesDetail.gaps.length > 0 && (
               <p className="gap">⚠️ Missing in this series: {seriesDetail.gaps.map((n) => `#${n}`).join(', ')} — you own {seriesDetail.books.map((b) => getSeries(b).index).filter((n) => n !== null).join(', ')}.</p>
             )}
             <div className="book-list">
-              {seriesDetail.books.map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
+              {seriesDetail.books.map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
             </div>
           </div>
         )}
@@ -1110,14 +1402,13 @@ export default function App() {
               <button onClick={() => runEnrichment('unsorted')} disabled={enriching || !books.filter(isUnsorted).length}>
                 {enriching ? 'Checking…' : `Scan Unsorted shelf (${books.filter(isUnsorted).length})`}
               </button>
-              <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
             </div>
             {enrichStatus && <p className="progress">{enrichStatus}</p>}
             {!books.filter(isUnsorted).filter(matchesFormatTab).length ? (
               <div className="card"><p>Unsorted shelf is empty{formatTab !== 'all' ? ' for this bottom tab — try All' : ''}. Every book in the library has a series, or a real title + author + cover.</p></div>
             ) : (
               <div className="book-list">
-                {books.filter(isUnsorted).filter(matchesFormatTab).map((b) => <BookRow key={b.id} book={b} onOpen={openBook} />)}
+                {books.filter(isUnsorted).filter(matchesFormatTab).map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
               </div>
             )}
           </div>
@@ -1131,6 +1422,7 @@ export default function App() {
                 {appTheme === 'dark' ? '☀️ Switch to light mode' : '🌙 Switch to dark mode'}
               </button>
               <p className="progress">Library view: {viewMode === 'list' ? 'List' : 'Grid'} — toggle it from the top bar in the Library.</p>
+              <p className="progress">ShelfSort v0.7.0</p>
             </div>
             <div className="card">
               <h2>Metadata fixes</h2>
@@ -1187,7 +1479,6 @@ export default function App() {
 
         {view === 'detail' && detail && (
           <div className="card">
-            <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', marginTop: 12 }}>
               {coverFor(detail) ? <img src={coverFor(detail)} alt="" style={{ width: 160, borderRadius: 8 }} /> : <div className="cover" style={{ width: 160 }}>No cover</div>}
               <div style={{ flex: 1, minWidth: 240 }}>
@@ -1195,7 +1486,7 @@ export default function App() {
                 <p>{detail.metadata.author || 'Unknown author'} · {formatLabel(detail)}</p>
                 <p>Publisher: {detail.metadata.publisher || '—'} · Date: {detail.metadata.date || '—'} · ISBN: {detail.metadata.isbn || '—'}</p>
                 <p>Series: {detail.metadata.series || getSeries(detail).name || '—'} {detail.metadata.seriesIndex ? `#${detail.metadata.seriesIndex}` : ''}</p>
-                <p>{detail.metadata.description || 'No description in this file.'}</p>
+                <p>{cleanDescription(detail.metadata.description) || 'No description in this file.'}</p>
                 {detail.autoApplied && detail.autoApplied.length > 0 && (
                   <div className="notice">
                     <strong>Auto-fixed (high confidence only):</strong>
@@ -1288,7 +1579,6 @@ export default function App() {
 
         {view === 'fixes' && (
           <div>
-            <button className="secondary" onClick={() => setView('library')}>← Back to library</button>
             <h2>Fix Review</h2>
             <p>{enrichStatus}</p>
             <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -1334,9 +1624,9 @@ export default function App() {
         )}
 
         {view === 'reader' && selected && (
-          <div className={`reader reader-full ${readerTheme}`}>
-            <div className="toolbar reader-minibar">
-              <button className="secondary" onClick={() => setView('detail')}>← Back</button>
+          <div className={`reader-screen ${readerTheme}`} style={edgeOffset ? { transform: `translateX(${edgeOffset}px)` } : undefined}>
+            <div className="toolbar reader-header">
+              
               <span className="reader-title">{selected.metadata.title}</span>
               <button className="secondary" onClick={() => setReaderToolbar((v) => !v)} aria-label="Reader settings">Aa</button>
             </div>
@@ -1363,22 +1653,36 @@ export default function App() {
                 {readerHits.length > 0 && (
                   <div className="card">
                     {readerHits.map((h, i) => (
-                      <div key={i}><button className="secondary" onClick={() => { pagePendingRef.current = h.frac; goToChapter(selected, h.chapter, chapters.length, 0); setReaderHits([]) }}>{h.title}</button> …{h.snippet}…</div>
+                      <div key={i}><button className="secondary" onClick={() => { pagePendingRef.current = h.page != null ? { page: h.page } : { frac: h.frac }; goToChapter(selected, h.chapter, chapters.length, 0); setReaderHits([]) }}>{h.title}</button> …{h.snippet}…</div>
                     ))}
                   </div>
                 )}
               </>
             )}
-            {!chapters.length ? <p className="progress">Loading chapters…</p> : (
+            {!chapters.length ? <p className="progress">Loading chapters…</p> : readerFallback ? (
+              <div className="reader-scroll" style={{ ['--reader-size']: `${fontSize}px` }} dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
+            ) : (
               <>
-                <div className="reader-pages" onTouchStart={onReaderTouchStart} onTouchMove={onReaderTouchMove} onTouchEnd={onReaderTouchEnd} onClick={onReaderClick}>
-                  <div className={`reader-flip${turnAnim ? ` turning-${turnAnim.dir > 0 ? 'next' : 'prev'}` : ''}`} style={flipStyle}>
-                    <div ref={pageRef} className="reader-column-flow chapter" style={{ ['--reader-size']: `${fontSize}px`, transform: `translateX(${-(pageIndex * (pageWidth || 0)) + dragOffset}px)`, transition: dragging ? 'none' : 'transform 0.25s ease' }}
-                      dangerouslySetInnerHTML={{ __html: chapters[chapterIndex]?.html || '<p>No readable chapter content found in this EPUB.</p>' }} />
-                    <div className="reader-turn-shadow" style={flipShadowStyle} aria-hidden="true" />
-                  </div>
+                <div className="reader-page-area" ref={pageAreaRef} onTouchStart={onReaderTouchStart} onTouchMove={onReaderTouchMove} onTouchEnd={onReaderTouchEnd} onClick={onReaderClick}>
+                  <div ref={measurerRef} className="reader-measurer" aria-hidden="true" />
+                  {(() => {
+                    const cur = pages[pageIndex] || pages[0] || { html: '', text: '' }
+                    if (!flip) {
+                      return <div className="reader-page" style={{ ['--reader-size']: `${fontSize}px` }} dangerouslySetInnerHTML={{ __html: cur.html }} />
+                    }
+                    const targetPage = flip.boundary ? null : pages[pageIndex + flip.dir]
+                    const angle = flip.dir > 0 ? -180 * flip.progress : 180 * flip.progress
+                    const origin = flip.dir > 0 ? 'left center' : 'right center'
+                    return (
+                      <div className="reader-flip-stage">
+                        <div className="reader-page reader-page-under" style={{ ['--reader-size']: `${fontSize}px` }} dangerouslySetInnerHTML={{ __html: targetPage ? targetPage.html : '' }} />
+                        <div className="reader-page reader-page-top" style={{ ['--reader-size']: `${fontSize}px`, transform: `rotateY(${angle}deg) scale(${1 - 0.03 * Math.sin(Math.PI * flip.progress)})`, transformOrigin: origin }} dangerouslySetInnerHTML={{ __html: cur.html }} />
+                        <div className="reader-flip-shadow" style={{ opacity: 0.55 * Math.sin(Math.PI * flip.progress), background: flip.dir > 0 ? 'linear-gradient(to left, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' : 'linear-gradient(to right, rgba(0,0,0,0.6), rgba(0,0,0,0) 60%)' }} aria-hidden="true" />
+                      </div>
+                    )
+                  })()}
                 </div>
-                <div className="toolbar reader-pagebar">
+                <div className="toolbar reader-footer">
                   <button className="secondary" onClick={prevPage}>←</button>
                   <span className="progress">Page {pageIndex + 1} of {pageCount} · Chapter {chapterIndex + 1} of {chapters.length} · {pageCount ? Math.round(((pageIndex + 1) / pageCount) * 100) : 0}%</span>
                   <button className="secondary" onClick={nextPage}>→</button>
@@ -1465,7 +1769,6 @@ function CloudView(props) {
     : (r2Form.accountId ? `https://${r2Form.accountId}.r2.cloudflarestorage.com` : 'https://<accountId>.r2.cloudflarestorage.com')
   return (
     <div>
-      <button className="secondary" onClick={onBack}>← Back to library</button>
       <h2>☁️ Cloud shelf — Cloudflare R2</h2>
       <p className="progress">
         How this works: your catalog (titles, covers, series, progress) always stays on this device.
@@ -1589,7 +1892,6 @@ function PdfViewer({ book, onBack, onSave }) {
 
   return (
     <div className="card viewer">
-      <button className="secondary" onClick={onBack}>← Back to book</button>
       <h2>{book.metadata.title}</h2>
       <div className="toolbar">
         <button className="secondary" disabled={page <= 1} onClick={() => setPage(page - 1)}>← Previous page</button>
@@ -1656,8 +1958,7 @@ function ComicViewer({ book, onBack, onSave }) {
   if (book.cbrUnsupported) {
     return (
       <div className="card">
-        <button className="secondary" onClick={onBack}>← Back to book</button>
-        <h2>{book.metadata.title}</h2>
+          <h2>{book.metadata.title}</h2>
         <div className="error">
           <strong>CBR cannot be opened yet.</strong> CBR is a RAR archive, not a zip, and no reliable browser RAR unpacker is bundled here.
           Convert it to CBZ with 7-Zip or Calibre, then import the CBZ instead.
@@ -1668,7 +1969,6 @@ function ComicViewer({ book, onBack, onSave }) {
 
   return (
     <div className="card viewer">
-      <button className="secondary" onClick={onBack}>← Back to book</button>
       <h2>{book.metadata.title}</h2>
       <div className="toolbar">
         <button className="secondary" disabled={page <= 0} onClick={() => goTo(page - 1)}>← Previous page</button>
@@ -1828,7 +2128,6 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
   const chapters = book.audioChapters || []
   return (
     <div className="card viewer">
-      <button className="secondary" onClick={() => { saveProgress(currentRef.current, chapterRef.current); onBack() }}>← Back to book</button>
       <h2>🎧 {book.metadata.title}</h2>
       <p>{book.metadata.author || 'Unknown author'}</p>
       {playerMode === 'native' && <p className="progress">Native player — keeps playing in the background, with lock-screen / notification controls.</p>}
@@ -1987,8 +2286,7 @@ function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
   if (!audioBook) {
     return (
       <div className="card">
-        <button className="secondary" onClick={onBack}>← Back to book</button>
-        <h2>Read-along</h2>
+          <h2>Read-along</h2>
         <p>No audiobook is linked to this book yet. Link one from the book detail page (automatic suggestion, or the manual link dropdown), then come back here.</p>
       </div>
     )
@@ -1996,7 +2294,6 @@ function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
 
   return (
     <div className="card viewer">
-      <button className="secondary" onClick={onBack}>← Back to book</button>
       <h2>🎧 Read-along: {epubBook.metadata.title}</h2>
       <p className="progress">
         <strong>Chapter-level sync, not word-by-word.</strong> When the audio chapter changes, the EPUB advances to the matching chapter (by title, otherwise by order).
