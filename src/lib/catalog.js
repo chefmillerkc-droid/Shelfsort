@@ -2,8 +2,14 @@
 // This is NOT a backdoor: nothing here opens a port, a socket, or a
 // persistent connection. Export is a file the owner chooses to share;
 // import only applies a file the owner chooses to load, and only to
-// whitelisted metadata fields. Book files, covers, progress, cloud
-// credentials and R2 keys are never in a catalog file.
+// whitelisted metadata fields. Book files, progress, cloud
+// credentials and R2 keys are never in a catalog file. Export never
+// includes cover URLs (it only records hasCover); import DOES accept
+// a coverUrl field on an entry, but only as a cover for a book that
+// currently has NO cover (neither coverDataUrl nor coverUrl) — it
+// never overwrites an existing cover, and a failed cover fetch still
+// stores the URL without failing the import (see applyValuesToBook
+// in App.jsx, which the catalog apply path uses for covers).
 export const CATALOG_FIELDS = ['title', 'author', 'publisher', 'date', 'isbn', 'description', 'series', 'seriesIndex']
 
 export function buildCatalog(books) {
@@ -74,6 +80,17 @@ export function computeCatalogChanges(books, entries) {
       if (next === undefined) continue
       const current = field === 'seriesIndex' ? (book.metadata?.seriesIndex ?? null) : (book.metadata?.[field] || '')
       if (next !== current) diffs.push({ field, from: current, to: next })
+    }
+    // Cover from a catalog entry: a coverUrl is a change ONLY when
+    // the book currently has no cover at all. It is recorded with
+    // field 'cover' (not a metadata field name) so the apply path
+    // can route it through applyValuesToBook's cover handling
+    // (fetch to a data URL, record fixedFields 'cover') instead of
+    // writing a raw metadata field. Existing covers are never
+    // overwritten by a catalog import.
+    if (typeof entry.coverUrl === 'string' && entry.coverUrl.trim()
+      && !book.metadata?.coverDataUrl && !book.metadata?.coverUrl) {
+      diffs.push({ field: 'cover', from: '', to: entry.coverUrl.trim() })
     }
     if (diffs.length) changes.push({ bookId: book.id, fileName: book.fileName || '', title: book.metadata?.title || '', diffs })
   }

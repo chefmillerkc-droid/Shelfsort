@@ -29,7 +29,12 @@ import { Capacitor } from '@capacitor/core'
 import { Filesystem, Directory } from '@capacitor/filesystem'
 
 export function audioStorePath(bookId, fileName) {
-  const ext = /\.mp3$/i.test(fileName || '') ? 'mp3' : 'm4b'
+  // Preserve the TRUE extension: ExoPlayer and the HTML player both
+  // sniff content, but a stored .m4a must not silently become .m4b
+  // (and .mp4 must stay .mp4) — the playback URI should describe
+  // the file that was actually imported.
+  const m = String(fileName || '').match(/\.(mp3|m4a|mp4|m4b)$/i)
+  const ext = m ? m[1].toLowerCase() : 'm4b'
   const safeId = String(bookId).replace(/[^a-zA-Z0-9_-]/g, '_')
   return `shelfsort-audio/audio-${safeId}.${ext}`
 }

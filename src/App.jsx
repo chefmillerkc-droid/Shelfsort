@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { getAllBooksMeta, getBookFile, putBookMeta, putBookFile, deleteBookFile, deleteBook, clearLibrary, saveProgressLocal, loadProgressLocal } from './lib/db.js'
 import { parseEpub, parseChapters, fetchAsDataUrl } from './lib/epub.js'
 import { parsePdf, loadPdf, renderPdfPage, searchPdf } from './lib/pdf.js'
-import { parseCbz, getCbzPageBlob, isCbrFile } from './lib/comic.js'
+import { parseComic, loadComicPages } from './lib/comic.js'
 import { parseAudio, parseMp3Tags, formatTime } from './lib/audio.js'
 import { enrichBook } from './lib/enrich.js'
 import { groupBySeries, getSeries, sortBooks } from './lib/series.js'
@@ -18,7 +18,8 @@ import { buildCorrectedEpub, downloadBlob } from './lib/exportEpub.js'
 import { buildCatalog, parseCatalog, computeCatalogChanges } from './lib/catalog.js'
 import { exportCatalogFile } from './lib/catalogExport.js'
 import { findAudioMatch, findEpubMatch, mapChapters, audioChapterAtTime } from './lib/readalong.js'
-import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile, listSafBookFiles, lazySafFile, base64ToArrayBuffer } from './lib/watchedFolders.js'
+import { folderNameOfFile, folderNameOfFiles, groupFilesByFolder, newFilesForRescan, isSupportedBookFile, listSafBookFiles, lazySafFile, base64ToArrayBuffer, dirOfFile } from './lib/watchedFolders.js'
+import { groupAudioEntries, globalChapters, mapGlobalToPart, resumeForSaved, knownSums } from './lib/multipart.js'
 import { ScopedStorage } from '@daniele-rolli/capacitor-scoped-storage'
 import {
   loadR2Settings, saveR2Settings, clearR2Settings, r2Endpoint,
@@ -37,7 +38,10 @@ function coverFor(book) {
 
 function formatLabel(book) {
   if (book.format === 'pdf') return 'PDF'
-  if (book.format === 'comic') return book.cbrUnsupported ? 'CBR' : 'CBZ'
+  if (book.format === 'comic') {
+    const m = String(book.fileName || '').match(/\.([a-z0-9]+)$/i)
+    return m ? m[1].toUpperCase() : 'Comic'
+  }
   if (book.format === 'audio') return 'Audiobook'
   return 'EPUB'
 }
@@ -176,9 +180,108 @@ function BookGridCard({ book, onOpen, onDetail }) {
     </button>
   )
 }
+
+// Shelf view: books standing upright on a shelf board, like physical
+// books. CSS only, no image assets. Row count is viewport width only
+// (never per-book measurement), so long libraries scroll exactly like
+// the grid does — same cover data URLs, same book data, no canvas.
+// Tap / long-press / scroll behaviour is the SAME usePressHandlers
+// as BookRow and BookGridCard (<500ms tap = open, >=500ms hold =
+// detail, >12px move = scroll, never opens). ShelfBook reuses
+// coverFor + progressFraction; it does not invent metadata.
+// Height variation is deterministic: a hash of the book id picks one
+// of five cover heights (108-132px), so a given book is always the
+// same height and rows stay bottom-aligned to the board. No-cover
+// books render as a titled spine block in a deterministic muted
+// colour (horizontal, wrapped, legible text — never a blank card).
+const SHELF_PALETTE = ['#5b4a3a', '#3f5a50', '#4a5568', '#6b4a5a', '#555f3a', '#7a5a2e', '#3e4a6b', '#64403a']
+function shelfHash(str) {
+  let h = 0
+  for (let i = 0; i < String(str).length; i++) h = (h * 31 + String(str).charCodeAt(i)) >>> 0
+  return h
+}
+function shelfColumns(width) {
+  if (width < 480) return 4
+  if (width < 768) return 5
+  if (width < 1100) return 7
+  return 9
+}
+// ShelfBook is cover-only on purpose: the board must sit directly
+// under the covers, not under a caption. The caption lives below the
+// board (ShelfCaption, same press handlers, same book), aligned to
+// its book by identical flex widths/gaps, so tapping either the book
+// or its caption opens (tap) / details (long-press) exactly like a
+// grid card. Series goes in the accessible name; grid cards show no
+// series line, so no visible series line is added here either.
+function ShelfBook({ book, onOpen, onDetail }) {
+  const cover = coverFor(book)
+  const frac = progressFraction(book)
+  const press = usePressHandlers(() => onOpen(book), () => onDetail(book))
+  const h = shelfHash(book.id || book.metadata.title || '')
+  const coverHeight = 108 + (h % 5) * 6 // 108, 114, 120, 126, 132px
+  const blockColor = SHELF_PALETTE[h % SHELF_PALETTE.length]
+  const series = getSeries(book).name
+  return (
+    <button
+      className="shelf-book"
+      {...press}
+      aria-label={`${book.metadata.title}${book.metadata.author ? ` by ${book.metadata.author}` : ''}${series ? `, ${series}` : ''}`}
+      title={`${book.metadata.title}${book.metadata.author ? ` — ${book.metadata.author}` : ''}`}
+    >
+      <span className="shelf-cover" style={{ height: `${coverHeight}px` }}>
+        {cover ? (
+          <img src={cover} alt="" />
+        ) : (
+          <span className="shelf-nocover" style={{ background: blockColor }}>
+            <span className="shelf-nocover-title">{book.metadata.title}</span>
+            {book.metadata.author && <span className="shelf-nocover-author">{book.metadata.author}</span>}
+          </span>
+        )}
+        {frac > 0 && (
+          <span className="shelf-progress" aria-hidden="true"><span style={{ width: `${Math.round(frac * 100)}%` }} /></span>
+        )}
+      </span>
+    </button>
+  )
+}
+function ShelfCaption({ book, onOpen, onDetail }) {
+  const press = usePressHandlers(() => onOpen(book), () => onDetail(book))
+  return (
+    <button className="shelf-caption-btn" {...press} aria-label={book.metadata.title}>
+      <span className="shelf-title">{book.metadata.title}</span>
+      <span className="shelf-author">{book.metadata.author || 'Unknown author'}</span>
+    </button>
+  )
+}
+function ShelfRows({ books, onOpen, onDetail }) {
+  const [width, setWidth] = useState(() => (typeof window !== 'undefined' ? window.innerWidth : 400))
+  useEffect(() => {
+    const onResize = () => setWidth(window.innerWidth)
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+  const cols = shelfColumns(width)
+  const rows = []
+  for (let i = 0; i < books.length; i += cols) rows.push(books.slice(i, i + cols))
+  return (
+    <div className="shelf-wrap">
+      {rows.map((row, ri) => (
+        <div className="shelf-row" key={ri}>
+          <div className="shelf-books">
+            {row.map((b) => <ShelfBook key={b.id} book={b} onOpen={onOpen} onDetail={onDetail} />)}
+          </div>
+          <div className="shelf-board" aria-hidden="true" />
+          <div className="shelf-captions">
+            {row.map((b) => <ShelfCaption key={b.id} book={b} onOpen={onOpen} onDetail={onDetail} />)}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
 export default function App() {
   const [books, setBooks] = useState([])
-  const [view, setView] = useState('library') // library | detail | reader | fixes | pdf | comic | audio | readalong
+  const [view, setView] = useState('library') // library | detail | reader | fixes | pdf | comic | audio | readalong | series | series-detail | authors | author-detail | unsorted | settings | cloud
   const viewRef = useRef(view)
   useEffect(() => { viewRef.current = view }, [view])
   // Back navigation, REPLACED by the in-app back swipe (see below).
@@ -197,6 +300,7 @@ export default function App() {
     if (v === 'reader' || v === 'pdf' || v === 'comic' || v === 'audio' || v === 'readalong') return 'detail'
     if (v === 'detail' || v === 'unsorted' || v === 'fixes' || v === 'cloud') return 'library'
     if (v === 'series-detail') return 'series'
+    if (v === 'author-detail') return 'authors'
     return null
   }
   // History entry for system back (see navigateBack / popstate).
@@ -221,17 +325,30 @@ export default function App() {
     if (formatTab === 'audiobooks') return b.format === 'audio'
     return true
   }
-  const [viewMode, setViewMode] = useState(() => { try { return localStorage.getItem('shelfsort-view') || 'list' } catch { return 'list' } })
+  // Library view mode: list | grid | shelf. Shelf is the default for
+  // a fresh install (no stored choice); a stored list/grid choice is
+  // always kept, and any unknown stored value falls back to shelf.
+  const [viewMode, setViewMode] = useState(() => {
+    try {
+      const v = localStorage.getItem('shelfsort-view')
+      return ['list', 'grid', 'shelf'].includes(v) ? v : 'shelf'
+    } catch { return 'shelf' }
+  })
   const [statusTab, setStatusTab] = useState('all')
   const [searchOpen, setSearchOpen] = useState(false)
   const [seriesDetail, setSeriesDetail] = useState(null)
+  // Author detail is a NAME, not a snapshot: the detail recomputes
+  // its books live from the library, so the search box and format
+  // tabs keep filtering inside an open author detail (series-detail
+  // keeps its click-time snapshot, as before).
+  const [authorDetail, setAuthorDetail] = useState(null)
   // Files for books currently OPEN only (0-2 books). The library list
   // itself is metadata-only, so 300 books never means 300 blobs in RAM.
   const [openFiles, setOpenFiles] = useState({})
   useEffect(() => { try { localStorage.setItem('shelfsort-view', viewMode) } catch { /* ignore */ } }, [viewMode])
   // Release open files whenever we leave a viewer/detail screen.
   useEffect(() => {
-    if (['library', 'series', 'series-detail', 'unsorted', 'settings', 'cloud', 'fixes'].includes(view)) setOpenFiles({})
+    if (['library', 'series', 'series-detail', 'authors', 'author-detail', 'unsorted', 'settings', 'cloud', 'fixes'].includes(view)) setOpenFiles({})
   }, [view])
   function withFile(meta) { return meta ? { ...meta, file: openFiles[meta.id] } : null }
   const [importStatus, setImportStatus] = useState('')
@@ -251,6 +368,21 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem('shelfsort-auto-apply-high', autoApplyHigh ? 'on' : 'off') } catch { /* ignore */ }
   }, [autoApplyHigh])
+  // Cover auto-apply on exact title+author match. Default OFF: a
+  // work-level cover can belong to a different edition, so this is
+  // opt-in only, and fuzzy/first-result covers are never auto-applied
+  // under it (enrich.js gates on high confidence). When on, the cover
+  // is recorded in the book's autoApplied list like any auto-fix.
+  const [autoApplyCoversExact, setAutoApplyCoversExact] = useState(() => {
+    try { return localStorage.getItem('shelfsort-auto-apply-covers-exact') === 'on' } catch { return false }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('shelfsort-auto-apply-covers-exact', autoApplyCoversExact ? 'on' : 'off') } catch { /* ignore */ }
+  }, [autoApplyCoversExact])
+  // True when the current Fix Review list came from a cover-only
+  // scan, so the review UI renders the thumbnail grid instead of
+  // the generic field list. Cleared by any other enrichment run.
+  const [coverReview, setCoverReview] = useState(false)
   // Watched library folders. Two kinds: SAF folders (v0.7.2, saved
   // tree URI + persistable permission — re-listed on startup with
   // no re-pick) and legacy WebView folders (NAME ONLY in
@@ -271,6 +403,20 @@ export default function App() {
     try { return localStorage.getItem('shelfsort-volume-keys') === 'on' } catch { return false }
   })
   useEffect(() => { try { localStorage.setItem('shelfsort-volume-keys', volumeKeysTurnPages ? 'on' : 'off') } catch { /* ignore */ } }, [volumeKeysTurnPages])
+  // Comic viewer defaults (Settings): manga mode (right-to-left)
+  // and webtoon mode (vertical strip) for newly opened comics.
+  // Both are also per-comic toggles in the viewer, remembered on
+  // that book's progress — the per-comic choice wins over these
+  // defaults once set. Both default OFF (normal left-to-right,
+  // one-page-at-a-time), matching Kuro's opt-in modes.
+  const [mangaDefault, setMangaDefault] = useState(() => {
+    try { return localStorage.getItem('shelfsort-manga-default') === 'on' } catch { return false }
+  })
+  useEffect(() => { try { localStorage.setItem('shelfsort-manga-default', mangaDefault ? 'on' : 'off') } catch { /* ignore */ } }, [mangaDefault])
+  const [webtoonDefault, setWebtoonDefault] = useState(() => {
+    try { return localStorage.getItem('shelfsort-webtoon-default') === 'on' } catch { return false }
+  })
+  useEffect(() => { try { localStorage.setItem('shelfsort-webtoon-default', webtoonDefault ? 'on' : 'off') } catch { /* ignore */ } }, [webtoonDefault])
   const volumeKeysRef = useRef(volumeKeysTurnPages)
   useEffect(() => { volumeKeysRef.current = volumeKeysTurnPages }, [volumeKeysTurnPages])
   // Latest-callback refs so native listeners (registered once per
@@ -404,28 +550,33 @@ export default function App() {
     if (/\.pdf$/i.test(name)) {
       return { format: 'pdf', metadata: await parsePdf(buf, name), extra: {} }
     }
-    if (/\.cbz$/i.test(name)) {
-      return { format: 'comic', metadata: await parseCbz(buf, name), extra: {} }
+    if (/\.cbz$/i.test(name) || /\.cbr$/i.test(name) || /\.cbt$/i.test(name) || /\.cb7$/i.test(name)) {
+      // CBZ via JSZip, CBR/CBT/CB7 via libarchive.js (WASM). A parse
+      // failure here fails just this file's import (importFiles
+      // catches per file) — never a fake open, never a batch crash.
+      // ComicInfo.xml inside the archive supplies series/author/
+      // date/description when present; filename fallback otherwise.
+      return { format: 'comic', metadata: await parseComic(buf, name), extra: {} }
     }
-    if (/\.cbr$/i.test(name)) {
-      // RAR cannot be opened in this browser build — detected, not faked.
-      const clean = name.replace(/\.cbr$/i, '').replace(/[_-]+/g, ' ').trim()
-      return { format: 'comic', metadata: { title: clean, titleFromFilename: true, author: '', creators: [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '', pageCount: 0 }, extra: { cbrUnsupported: true } }
-    }
-    if (/\.m4b$/i.test(name)) {
+    if (/\.m4b$/i.test(name) || /\.m4a$/i.test(name) || /\.mp4$/i.test(name)) {
+      // M4A and MP4 are the same MP4 audio container as M4B (M4B is
+      // just the bookmarkable audiobook variant), so they parse
+      // identically. MP4 here is treated as AUDIO: an MP4 video
+      // track, if any, is ignored by the audio-only player — no
+      // video player is built for it.
       const parsed = parseAudio(buf, name)
-      return { format: 'audio', metadata: { ...parsed, chapters: undefined }, extra: { audioChapters: parsed.chapters, durationSec: parsed.durationSec } }
+      return { format: 'audio', metadata: { ...parsed, chapters: undefined }, extra: { audioChapters: parsed.chapters, durationSec: parsed.durationSec, album: parsed.album } }
     }
     if (/\.mp3$/i.test(name)) {
       const tags = parseMp3Tags(buf, name)
-      return { format: 'audio', metadata: { title: tags.title, titleFromFilename: tags.titleFromFilename, author: tags.author, creators: tags.author ? [tags.author] : [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '' }, extra: { audioChapters: [], durationSec: null } }
+      return { format: 'audio', metadata: { title: tags.title, titleFromFilename: tags.titleFromFilename, author: tags.author, creators: tags.author ? [tags.author] : [], language: '', publisher: '', date: '', description: '', identifier: '', isbn: '', series: '', seriesIndex: '', coverDataUrl: '' }, extra: { audioChapters: [], durationSec: null, album: tags.album } }
     }
     throw new Error('Unsupported file type')
   }
 
   async function importFiles(fileList) {
-    const files = [...fileList].filter((f) => /\.(epub|pdf|cbz|cbr|m4b|mp3)$/i.test(f.name))
-    if (!files.length) { setImportStatus('No supported files found (.epub, .pdf, .cbz, .cbr, .m4b, .mp3).'); return }
+    const files = [...fileList].filter((f) => /\.(epub|pdf|cbz|cbr|cbt|cb7|m4b|m4a|mp4|mp3)$/i.test(f.name))
+    if (!files.length) { setImportStatus('No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'); return }
     setImportStatus(`Importing ${files.length} file(s)…`)
     setImportErrors([])
     const errors = []
@@ -433,13 +584,32 @@ export default function App() {
     // One book at a time, committed immediately: meta + file are each
     // written before moving on, so a crash mid-import keeps everything
     // imported so far and the user can simply re-import the rest.
-    // Only one file buffer is alive at a time; nothing is accumulated.
+    // Only one file buffer is alive at a time; nothing is accumulated
+    // — except audio entries, which are collected WITHOUT their
+    // buffers for multi-part grouping below (buffers are re-read
+    // per part when the grouped book is stored, so a multi-hundred-MB
+    // audiobook never sits fully in memory as one group).
+    const audioEntries = []
     for (const file of files) {
       try {
         const buf = await file.arrayBuffer()
         const parsed = await parseByFormat(file, buf)
+        if (parsed.format === 'audio') {
+          audioEntries.push({
+            file,
+            dir: dirOfFile(file),
+            parsed: {
+              title: parsed.metadata.title,
+              author: parsed.metadata.author,
+              album: parsed.extra.album || '',
+              durationSec: parsed.extra.durationSec || null,
+              chapters: parsed.extra.audioChapters || [],
+              metadata: parsed.metadata,
+            },
+          })
+          continue
+        }
         const metadata = { ...parsed.metadata }
-        if (parsed.extra.durationSec) metadata.durationSec = parsed.extra.durationSec
         const id = uid()
         const meta = {
           id,
@@ -447,37 +617,82 @@ export default function App() {
           format: parsed.format,
           metadata,
           audioChapters: parsed.extra.audioChapters || [],
-          cbrUnsupported: !!parsed.extra.cbrUnsupported,
           addedAt: Date.now(),
           progress: null,
           fixedFields: [],
           hasFile: true,
         }
         await putBookMeta(meta)
-        // Audio: written ONCE at import to the app file store
-        // (audioStore.js); the resulting URI is the playback source
-        // and NO blob is stored in IndexedDB for audio (no double
-        // storage). If that store fails (e.g. web build), fall back
-        // to the IndexedDB blob + HTML player path instead of
-        // failing the import.
-        if (parsed.format === 'audio') {
-          const uri = await storeAudioFile(id, file.name, buf)
-          if (uri) {
-            await putBookMeta({ ...meta, audioFileUri: uri })
-          } else {
-            await putBookFile(id, buf)
-          }
-        } else {
-          await putBookFile(id, buf)
-        }
+        await putBookFile(id, buf)
         imported++
-        setImportStatus(`Imported ${imported} of ${files.length} — ${meta.metadata.title}`)
+        setImportStatus(`Imported ${imported} book(s) — ${meta.metadata.title}`)
       } catch (e) {
         errors.push(`${file.name}: ${e.message}`)
       }
     }
+    // Multi-part audiobooks (see src/lib/multipart.js for the rules):
+    // same book folder = one book; flat picks group only on a shared
+    // album or a shared prefix + part numbers. Single-file audio
+    // entries go through exactly the old path (one book, one URI).
+    // Grouping applies to NEW imports only — books already in the
+    // library as separate files are NOT merged retroactively (that
+    // would rewrite the library without approval; a manual
+    // "group these books" action is a future option, not built here).
+    for (const group of groupAudioEntries(audioEntries)) {
+      try {
+        const first = group.entries[0]
+        const id = uid()
+        const partsMeta = group.entries.map((e) => ({
+          durationSec: e.parsed.durationSec,
+          chapters: e.parsed.chapters,
+        }))
+        const isMulti = group.entries.length > 1
+        const knownDurations = partsMeta.map((p) => p.durationSec).filter((d) => typeof d === 'number' && d > 0)
+        const totalSec = knownDurations.length ? knownDurations.reduce((a, b) => a + b, 0) : null
+        const metadata = { ...first.parsed.metadata, title: group.title, author: group.author, creators: group.author ? [group.author] : [] }
+        if (totalSec) metadata.durationSec = totalSec
+        const meta = {
+          id,
+          fileName: first.file.name,
+          format: 'audio',
+          metadata,
+          // Global chapters: each part's chapters shifted by its
+          // start offset (parts after an unknown-duration part are
+          // omitted, never faked — see multipart.js).
+          audioChapters: globalChapters(partsMeta),
+          addedAt: Date.now(),
+          progress: null,
+          fixedFields: [],
+          hasFile: true,
+        }
+        await putBookMeta(meta)
+        // Store each part: native file store first (true extension
+        // preserved per audioStore.js), IndexedDB blob under the
+        // part id as the web/HTML fallback. The book-level
+        // audioFileUri is the FIRST part's URI: read-along with a
+        // multi-part book plays part 1 only (documented limit —
+        // read-along is out of scope for the multi-part player).
+        const audioParts = []
+        for (let i = 0; i < group.entries.length; i++) {
+          const entry = group.entries[i]
+          const partId = isMulti ? `${id}-p${i}` : id
+          const buf = await entry.file.arrayBuffer()
+          const uri = await storeAudioFile(partId, entry.file.name, buf)
+          if (!uri) await putBookFile(partId, buf)
+          audioParts.push({ partId, fileName: entry.file.name, audioFileUri: uri || null, durationSec: entry.parsed.durationSec || null })
+        }
+        const update = { ...meta }
+        if (isMulti) update.audioParts = audioParts
+        if (audioParts[0] && audioParts[0].audioFileUri) update.audioFileUri = audioParts[0].audioFileUri
+        await putBookMeta(update)
+        imported++
+        setImportStatus(`Imported ${imported} book(s) — ${meta.metadata.title}${isMulti ? ` (${group.entries.length} parts)` : ''}`)
+      } catch (e) {
+        for (const entry of group.entries) errors.push(`${entry.file.name}: ${e.message}`)
+      }
+    }
     setImportErrors(errors)
-    setImportStatus(`Done — imported ${imported} of ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
+    setImportStatus(`Done — imported ${imported} book(s) from ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
     // Metadata only — never reload full file blobs after an import.
     await reload()
   }
@@ -493,7 +708,7 @@ export default function App() {
   async function handleFolderPick(fileList, mode) {
     const files = [...fileList].filter(isSupportedBookFile)
     if (!files.length) {
-      const msg = 'No supported files found (.epub, .pdf, .cbz, .cbr, .m4b, .mp3).'
+      const msg = 'No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'
       if (mode === 'add' || mode === 'rescan') setWatchStatus(msg); else setImportStatus(msg)
       return
     }
@@ -581,24 +796,24 @@ export default function App() {
   async function importSafFolder(w) {
     const found = await scanSafFolder(w)
     const existing = await getAllBooksMeta()
-    const toImport = newFilesForRescan(found.map((f) => ({ name: f.name })), existing)
-    const lazyByName = new Map()
+    const toImport = newFilesForRescan(found, existing)
+    const lazyByPath = new Map()
     for (const f of found) {
-      if (!toImport.some((t) => t.name === f.name)) continue
-      lazyByName.set(f.name, lazySafFile(f.name, async () => {
+      if (!toImport.some((t) => t.path === f.path)) continue
+      lazyByPath.set(f.path, lazySafFile(f.name, async () => {
         const res = await ScopedStorage.readFile({ folder: safFolderRef(w), path: f.path, encoding: 'base64' })
         return base64ToArrayBuffer(res.data)
-      }))
+      }, f.dir || ''))
     }
-    // newFilesForRescan can return two entries with the same name
-    // (same file name in two subfolders); importFiles keys books by
-    // fileName, so keep only the first of each name here.
-    const seenNames = new Set()
+    // Paths are unique by construction (full relative path), so two
+    // book folders with the same part filenames (e.g. "part1.m4b"
+    // in two books) both import — the old name-keyed dedupe here
+    // dropped the second one. Library-level dedupe above still
+    // skips a file already in the library (no retroactive merge).
     const lazyFiles = []
     for (const t of toImport) {
-      if (seenNames.has(t.name)) continue
-      seenNames.add(t.name)
-      lazyFiles.push(lazyByName.get(t.name))
+      const lazy = lazyByPath.get(t.path)
+      if (lazy) lazyFiles.push(lazy)
     }
     if (lazyFiles.length) await importFiles(lazyFiles)
     else await reload()
@@ -732,16 +947,28 @@ export default function App() {
   async function runEnrichment(scope = 'all') {
     // Scoped by choice, never auto-run on import: 'unsorted' scans
     // only the Unsorted shelf; 'all' keeps the old whole-library
-    // scan. Import itself never enriches — books arrive as-is.
-    const scopeBooks = scope === 'unsorted' ? books.filter(isUnsorted) : [...books]
+    // scan; 'covers' scans ONLY books with no cover (neither
+    // coverDataUrl nor coverUrl) and collects ONLY cover proposals —
+    // every other missing field is ignored in that run, and a book
+    // that already has a cover is never scanned or overwritten.
+    // Import itself never enriches — books arrive as-is.
+    const noCover = (b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)
+    const scopeBooks = scope === 'unsorted' ? books.filter(isUnsorted)
+      : scope === 'covers' ? books.filter(noCover)
+      : [...books]
     if (!scopeBooks.length) {
-      setEnrichStatus(scope === 'unsorted' ? 'Unsorted shelf is empty — nothing to fix.' : 'No books to check.')
+      setEnrichStatus(scope === 'unsorted' ? 'Unsorted shelf is empty — nothing to fix.'
+        : scope === 'covers' ? 'Every book already has a cover — nothing to find.'
+        : 'No books to check.')
       return
     }
     setEnriching(true)
-    setEnrichStatus(`Checking ${scope === 'unsorted' ? 'Unsorted shelf' : 'all books'} for missing metadata…`)
+    setEnrichStatus(scope === 'covers'
+      ? `Finding covers for ${scopeBooks.length} book${scopeBooks.length === 1 ? '' : 's'} with no cover…`
+      : `Checking ${scope === 'unsorted' ? 'Unsorted shelf' : 'all books'} for missing metadata…`)
     setProposals([])
     setAutoFixedSummary([])
+    setCoverReview(scope === 'covers')
     const review = []
     const autoSummary = []
     // Snapshot the library at run start: auto-applying mutates books,
@@ -750,17 +977,25 @@ export default function App() {
     for (let i = 0; i < snapshot.length; i++) {
       setEnrichStatus(`Checking ${i + 1} of ${snapshot.length}: ${snapshot[i].metadata.title}`)
       try {
-        const result = await enrichBook(snapshot[i])
+        const result = await enrichBook(snapshot[i], { coverAutoApplyExact: autoApplyCoversExact })
         if (!result) continue
+        // Cover-only run: drop everything except the cover proposal
+        // before any auto-apply or review step, so no other field
+        // can be auto-applied or reviewed by a covers scan.
+        const coverOnly = (obj) => (obj && obj.coverUrl ? { coverUrl: obj.coverUrl } : {})
+        const autoPart = scope === 'covers' ? coverOnly(result.autoProposals) : (result.autoProposals || {})
+        const reviewPart = scope === 'covers' ? coverOnly(result.reviewProposals) : (result.reviewProposals || {})
+        const fullPart = scope === 'covers' ? coverOnly(result.proposals) : (result.proposals || {})
         // High-confidence, auto-apply ON: apply immediately, no prompt.
-        // The review-only remainder (e.g. a non-ISBN cover) still
-        // goes to Fix Review, even for a high-confidence book.
-        if (autoApplyHigh && Object.keys(result.autoProposals || {}).length) {
-          const updated = await applyValuesToBook(snapshot[i], result.autoProposals, {
+        // The review-only remainder (e.g. a non-ISBN cover when the
+        // exact-cover toggle is off) still goes to Fix Review, even
+        // for a high-confidence book.
+        if (autoApplyHigh && Object.keys(autoPart).length) {
+          const updated = await applyValuesToBook(snapshot[i], autoPart, {
             source: result.source,
             confidenceReason: result.confidenceReason,
           })
-          const fields = Object.keys(result.autoProposals).map((f) => (f === 'coverUrl' ? 'cover' : f))
+          const fields = Object.keys(autoPart).map((f) => (f === 'coverUrl' ? 'cover' : f))
           autoSummary.push({
             bookId: snapshot[i].id,
             title: updated.metadata.title || snapshot[i].metadata.title,
@@ -771,7 +1006,7 @@ export default function App() {
         }
         // Toggle OFF restores ask-every-time: the full proposal set,
         // including high-confidence fields, goes to Fix Review.
-        const reviewFields = autoApplyHigh ? (result.reviewProposals || {}) : (result.proposals || {})
+        const reviewFields = autoApplyHigh ? reviewPart : fullPart
         if (Object.keys(reviewFields).length) {
           review.push({ ...result, proposals: reviewFields })
         }
@@ -848,11 +1083,20 @@ export default function App() {
     for (const change of catalogPreview.changes) {
       const book = books.find((b) => b.id === change.bookId)
       if (!book) continue
+      // 'cover' diffs are NOT metadata fields: route them through
+      // applyValuesToBook's cover handling (fetch to a data URL,
+      // record fixedFields 'cover', store the URL even if the fetch
+      // fails) and never overwrite a cover that appeared since the
+      // preview was computed.
+      const coverDiff = change.diffs.find((d) => d.field === 'cover')
       const patch = {}
-      for (const d of change.diffs) patch[d.field] = d.to
-      const updated = { ...book, metadata: { ...book.metadata, ...patch } }
+      for (const d of change.diffs) if (d.field !== 'cover') patch[d.field] = d.to
+      let updated = { ...book, metadata: { ...book.metadata, ...patch } }
       if (change.diffs.some((d) => d.field === 'title')) updated.titleFromFilename = false
       await putBookMeta(updated)
+      if (coverDiff && !updated.metadata.coverDataUrl && !updated.metadata.coverUrl) {
+        updated = await applyValuesToBook(updated, { coverUrl: coverDiff.to }, null)
+      }
       applied++
     }
     setCatalogPreview(null)
@@ -1002,16 +1246,11 @@ export default function App() {
   }
 
   // Tap on a row/card opens the book DIRECTLY — no detail page in
-  // between — exactly as the old Read/Play buttons did. CBR cannot
-  // open at all, so it falls back to the detail page, which is the
-  // only place that explains the CBR limitation.
+  // between — exactly as the old Read/Play buttons did.
   async function openDirect(book) {
     if (book.format === 'epub') return openReader(book)
     if (book.format === 'pdf') return openViewer(book, 'pdf')
-    if (book.format === 'comic') {
-      if (book.cbrUnsupported) return openBook(book)
-      return openViewer(book, 'comic')
-    }
+    if (book.format === 'comic') return openViewer(book, 'comic')
     if (book.format === 'audio') return openViewer(book, 'audio')
     return openBook(book)
   }
@@ -1179,7 +1418,7 @@ export default function App() {
   // navigation (reader exit saves progress there), so one back
   // press is exactly one navigation — never a setView here AND a
   // popstate navigation. Only a top-level tab view with no back
-  // destination (Library, Series, Settings) exits the app.
+  // destination (Library, Series, Authors, Settings) exits the app.
   useEffect(() => {
     if (!Capacitor.isNativePlatform()) return
     let handle = null
@@ -1189,7 +1428,7 @@ export default function App() {
           const v = viewRef.current
           if (backDestinationFor(v)) {
             if (navigateBackRef.current) navigateBackRef.current(v)
-          } else if (v === 'library' || v === 'series' || v === 'settings') {
+          } else if (v === 'library' || v === 'series' || v === 'authors' || v === 'settings') {
             CapApp.exitApp().catch(() => { /* exit is best-effort */ })
           }
           // Any other view with no back destination: swallow the
@@ -1498,7 +1737,7 @@ export default function App() {
     if (view !== 'reader' && backDestinationFor(view) && e.touches[0].clientX >= 56 && e.touches[0].clientX <= 160) {
       navEdgeRef.current = { x: e.touches[0].clientX, t: Date.now(), moved: false }
     }
-    if (!['library', 'series', 'series-detail', 'unsorted'].includes(view)) return
+    if (!['library', 'series', 'series-detail', 'authors', 'author-detail', 'unsorted'].includes(view)) return
     if (window.scrollY > 0) return
     ptrStartY.current = e.touches[0].clientY
   }
@@ -1617,7 +1856,24 @@ export default function App() {
     return list
   }, [books, search, formatTab])
   const seriesGroups = useMemo(() => groupBySeries(seriesBase), [seriesBase])
-  const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'fixes' ? 'Fix Review' : 'Library'
+  // Authors mirror Series exactly: same base (format tab + search
+  // over title/author/series/fileName, so typing an author name
+  // filters the list to that author), grouped by trimmed author,
+  // A-Z with "Unknown author" last. Books with no author land in
+  // "Unknown author", never in a blank or first row.
+  const authorNameOf = (b) => ((b.metadata.author || '').trim() || 'Unknown author')
+  const authorGroups = useMemo(() => {
+    const map = new Map()
+    for (const b of seriesBase) {
+      const name = authorNameOf(b)
+      if (!map.has(name)) map.set(name, [])
+      map.get(name).push(b)
+    }
+    const groups = [...map.entries()].map(([name, books]) => ({ name, books: sortBooks(books, 'author') }))
+    groups.sort((a, b) => ((a.name === 'Unknown author' ? 1 : 0) - (b.name === 'Unknown author' ? 1 : 0)) || a.name.localeCompare(b.name))
+    return groups
+  }, [seriesBase])
+  const headerTitle = view === 'series' || view === 'series-detail' ? 'Series' : view === 'authors' || view === 'author-detail' ? 'Authors' : view === 'unsorted' ? 'Unsorted' : view === 'settings' ? 'Settings' : view === 'fixes' ? 'Fix Review' : 'Library'
   const detail = selected && books.find((b) => b.id === selected.id)
   const detailPair = detail ? linkedPairFor(detail) : null
   const detailAuto = detail ? autoMatchFor(detail) : null
@@ -1629,8 +1885,13 @@ export default function App() {
         <div className="topbar-actions">
           <button className="icon-btn" onClick={() => setSearchOpen(!searchOpen)} aria-label="Search">🔍</button>
           {view === 'library' && (
-            <button className="icon-btn" onClick={() => setViewMode(viewMode === 'list' ? 'grid' : 'list')} aria-label="Toggle list/grid view">
-              {viewMode === 'list' ? '▦' : '☰'}
+            <button
+              className="icon-btn"
+              onClick={() => setViewMode(viewMode === 'list' ? 'grid' : viewMode === 'grid' ? 'shelf' : 'list')}
+              aria-label={`Library view: ${viewMode === 'list' ? 'List' : viewMode === 'grid' ? 'Grid' : 'Shelf'} (tap to change)`}
+              title={`Library view: ${viewMode === 'list' ? 'List' : viewMode === 'grid' ? 'Grid' : 'Shelf'}`}
+            >
+              {viewMode === 'list' ? '▦' : viewMode === 'grid' ? '📚' : '☰'}
             </button>
           )}
           <button className="icon-btn" onClick={() => setView('settings')} aria-label="Settings">⋮</button>
@@ -1638,6 +1899,7 @@ export default function App() {
         <nav className="topnav">
           <button className={view === 'library' ? 'active' : ''} onClick={() => setView('library')}>Library</button>
           <button className={view === 'series' || view === 'series-detail' ? 'active' : ''} onClick={() => setView('series')}>Series</button>
+          <button className={view === 'authors' || view === 'author-detail' ? 'active' : ''} onClick={() => setView('authors')}>Authors</button>
           <button className={view === 'unsorted' ? 'active' : ''} onClick={() => setView('unsorted')}>Unsorted{books.filter(isUnsorted).length ? ` (${books.filter(isUnsorted).length})` : ''}</button>
           <button className={view === 'settings' ? 'active' : ''} onClick={() => setView('settings')}>Settings</button>
         </nav>
@@ -1647,7 +1909,7 @@ export default function App() {
       </header>}
 
       <main className={view === 'reader' ? 'reader-main' : ''} style={navEdgeOffset ? { transform: `translateX(${navEdgeOffset}px)` } : undefined} onTouchStart={onPtrTouchStart} onTouchMove={onPtrTouchMove} onTouchEnd={onPtrTouchEnd} onClickCapture={(e) => { if (Date.now() - navEdgeClickBlockRef.current < 300) { e.preventDefault(); e.stopPropagation() } }}>
-        {['library', 'series', 'series-detail', 'unsorted'].includes(view) && (pullDist > 0 || ptrRefreshing) && (
+        {['library', 'series', 'series-detail', 'authors', 'author-detail', 'unsorted'].includes(view) && (pullDist > 0 || ptrRefreshing) && (
           <div className="ptr" style={{ height: ptrRefreshing ? 48 : pullDist }}>
             {ptrRefreshing ? 'Refreshing…' : (pullDist >= 70 ? 'Release to refresh' : 'Pull to refresh')}
           </div>
@@ -1686,8 +1948,8 @@ export default function App() {
                 <button onClick={() => fileRef.current.click()}>Choose files</button>
                 <button className="secondary" onClick={() => folderRef.current.click()}>Choose a folder</button>
               </div>
-              <input ref={fileRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden onChange={(e) => importFiles(e.target.files)} />
-              <input ref={folderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden webkitdirectory=""
+              <input ref={fileRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.cbt,.cb7,.m4b,.m4a,.mp4,.mp3" multiple hidden onChange={(e) => importFiles(e.target.files)} />
+              <input ref={folderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.cbt,.cb7,.m4b,.m4a,.mp4,.mp3" multiple hidden webkitdirectory=""
                 onChange={(e) => { const mode = folderPickModeRef.current; folderPickModeRef.current = 'library'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
               <p className="progress">{importStatus}</p>
               {importErrors.length > 0 && (
@@ -1722,6 +1984,8 @@ export default function App() {
               </div>
             ) : !filtered.length ? (
               <div className="card"><p>No books match this filter.</p></div>
+            ) : viewMode === 'shelf' ? (
+              <ShelfRows books={filtered} onOpen={openDirect} onDetail={openBook} />
             ) : viewMode === 'grid' ? (
               <div className="book-grid-wrap">
                 {filtered.map((b) => <BookGridCard key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
@@ -1760,11 +2024,56 @@ export default function App() {
             {seriesDetail.gaps.length > 0 && (
               <p className="gap">⚠️ Missing in this series: {seriesDetail.gaps.map((n) => `#${n}`).join(', ')} — you own {seriesDetail.books.map((b) => getSeries(b).index).filter((n) => n !== null).join(', ')}.</p>
             )}
-            <div className="book-list">
-              {seriesDetail.books.map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
-            </div>
+            {/* A series detail is a shelf by definition: ALWAYS
+                ShelfRows, regardless of the flat Library's
+                List/Grid/Shelf toggle (which controls the flat
+                Library view only). Books keep their series order
+                (seriesIndex, then title) from groupBySeries. */}
+            <ShelfRows books={seriesDetail.books} onOpen={openDirect} onDetail={openBook} />
           </div>
         )}
+
+        {view === 'authors' && (
+          <div className="series-list">
+            {!authorGroups.length && <div className="card"><p>No authors yet — authors come from a book's own metadata, or a manual edit on its detail page. Books with no author are listed under "Unknown author".</p></div>}
+            {authorGroups.map((g) => (
+              <button key={g.name} className="series-row" onClick={() => { setAuthorDetail(g.name); setView('author-detail') }}>
+                <span className="series-tag">✍️</span>
+                <span className="series-name">{g.name}</span>
+                <span className="series-count">{g.books.length}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {view === 'author-detail' && authorDetail && (() => {
+          // Live recompute (not a snapshot): format tab + search
+          // keep filtering inside an open author detail, exactly
+          // like the Series base does for its list.
+          const q = search.trim().toLowerCase()
+          let list = books.filter(matchesFormatTab).filter((b) => authorNameOf(b) === authorDetail)
+          if (q) {
+            list = list.filter((b) => [b.metadata.title, b.metadata.author, getSeries(b).name, b.fileName].join(' ').toLowerCase().includes(q))
+          }
+          const groups = groupBySeries(list)
+          return (
+            <div>
+              <h2>{authorDetail}</h2>
+              {!list.length ? (
+                <div className="card"><p>No books match this filter for this author.</p></div>
+              ) : groups.map((g) => (
+                <div className="series-group" key={g.key}>
+                  {/* groupBySeries orders series groups A-Z with
+                      books by seriesIndex inside, and Standalone
+                      last — so an author with several series is
+                      never one jumbled shelf. */}
+                  <h2>{g.name} ({g.books.length})</h2>
+                  <ShelfRows books={g.books} onOpen={openDirect} onDetail={openBook} />
+                </div>
+              ))}
+            </div>
+          )
+        })()}
 
         {view === 'unsorted' && (
           <div>
@@ -1797,12 +2106,20 @@ export default function App() {
               <button className="secondary" onClick={() => setAppTheme(appTheme === 'dark' ? 'light' : 'dark')}>
                 {appTheme === 'dark' ? '☀️ Switch to light mode' : '🌙 Switch to dark mode'}
               </button>
-              <p className="progress">Library view: {viewMode === 'list' ? 'List' : 'Grid'} — toggle it from the top bar in the Library.</p>
+              <p className="progress">Library view: {viewMode === 'list' ? 'List' : viewMode === 'grid' ? 'Grid' : 'Shelf'} — tap the view button in the top bar in the Library to cycle List → Grid → Shelf.</p>
               <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                 <input type="checkbox" checked={volumeKeysTurnPages} onChange={(e) => setVolumeKeysTurnPages(e.target.checked)} />
                 Volume keys turn pages (in the reader: volume down = next page, volume up = previous page; the volume itself does not change while reading)
               </label>
-              <p className="progress">ShelfSort v0.7.2</p>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={mangaDefault} onChange={(e) => setMangaDefault(e.target.checked)} />
+                Comics open in manga mode by default (right-to-left page order; can still be toggled per comic in the viewer)
+              </label>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
+                Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
+              </label>
+              <p className="progress">ShelfSort v0.7.3</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
@@ -1815,7 +2132,7 @@ export default function App() {
                 <button onClick={() => { if (isNative) addSafFolder(); else watchFolderRef.current.click() }}>Add folder</button>
                 <button className="secondary" disabled={!watchedFolders.length} onClick={() => { if (isNative) rescanAllSafFolders(); else { watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() } }}>Rescan watched folders</button>
               </div>
-              <input ref={watchFolderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.m4b,.mp3" multiple hidden webkitdirectory=""
+              <input ref={watchFolderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.cbt,.cb7,.m4b,.m4a,.mp4,.mp3" multiple hidden webkitdirectory=""
                 onChange={(e) => { const mode = watchPickModeRef.current; watchPickModeRef.current = 'add'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
               {!watchedFolders.length ? (
                 <p className="progress">No watched folders yet. Add one with the button above.</p>
@@ -1842,6 +2159,11 @@ export default function App() {
                 <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
                 Auto-apply high-confidence fixes (only ask when unsure)
               </label>
+              <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <input type="checkbox" checked={autoApplyCoversExact} onChange={(e) => setAutoApplyCoversExact(e.target.checked)} />
+                Auto-apply covers on exact title+author match
+              </label>
+              <p className="progress">Cover auto-apply is off by default for a reason: a cover from a title+author search can belong to a different edition than yours, so an auto-applied cover can be the wrong edition's cover. Turn it on only if you accept that — fuzzy or first-result covers are never auto-applied, and any auto-applied cover is recorded on the book's detail page so you can correct it.</p>
               <div className="toolbar">
                 <button onClick={() => runEnrichment('unsorted')} disabled={enriching || !books.filter(isUnsorted).length}>
                   {enriching ? 'Checking…' : `Scan Unsorted shelf (${books.filter(isUnsorted).length})`}
@@ -1849,13 +2171,16 @@ export default function App() {
                 <button className="secondary" onClick={() => runEnrichment('all')} disabled={enriching || !books.length}>
                   {enriching ? 'Checking…' : 'Find fixes (all books)'}
                 </button>
+                <button className="secondary" onClick={() => runEnrichment('covers')} disabled={enriching || !books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length}>
+                  {enriching ? 'Checking…' : `Find missing covers (${books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length})`}
+                </button>
               </div>
               {enrichStatus && <p className="progress">{enrichStatus}</p>}
-              <p className="progress">High confidence means an ISBN match to the same edition, or an exact title + author match with a single result. Everything uncertain goes to Fix Review.</p>
+              <p className="progress">High confidence means an ISBN match to the same edition, or an exact title + author match with a single result. Everything uncertain goes to Fix Review. “Find missing covers” only scans books with no cover, only proposes covers (never other fields, never overwriting a cover), and shows them as thumbnails in Fix Review — apply per book, or all at once.</p>
             </div>
             <div className="card">
               <h2>Muse catalog — export / import</h2>
-              <p className="progress">Let Muse sort the whole catalog — series, series order, authors, titles — without any backdoor or live access to your phone. Export a metadata-only catalog, share that file, then import the corrected file back. Nothing is applied until you press Apply, and import only changes title, author, publisher, date, ISBN, description, series, and series number. Book files, covers, reading progress, and cloud credentials are never in a catalog file and are never changed by an import.</p>
+              <p className="progress">Let Muse sort the whole catalog — series, series order, authors, titles — without any backdoor or live access to your phone. Export a metadata-only catalog, share that file, then import the corrected file back. Nothing is applied until you press Apply, and import only changes title, author, publisher, date, ISBN, description, series, and series number — plus a coverUrl, but only for a book that currently has no cover (an existing cover is never overwritten by a catalog import). Book files, reading progress, and cloud credentials are never in a catalog file and are never changed by an import.</p>
               <div className="toolbar">
                 <button onClick={exportCatalog} disabled={!books.length}>Export catalog ({books.length})</button>
                 <button className="secondary" onClick={() => catalogFileRef.current.click()}>Import catalog…</button>
@@ -1867,7 +2192,12 @@ export default function App() {
                   <p className="progress">{catalogPreview.changes.length} book{catalogPreview.changes.length === 1 ? '' : 's'} would change, {catalogPreview.unchanged} unchanged, {catalogPreview.unmatched.length} unmatched and skipped.</p>
                   {catalogPreview.changes.slice(0, 20).map((c) => (
                     <div key={c.bookId} className="progress">
-                      <strong>{c.title || c.fileName}</strong>: {c.diffs.map((d) => `${d.field}: ${d.from === null || d.from === '' ? '—' : d.from} → ${d.to === null || d.to === '' ? '—' : d.to}`).join(' · ')}
+                      <strong>{c.title || c.fileName}</strong>: {c.diffs.map((d) => d.field === 'cover'
+                        ? `cover: — → ${d.to}`
+                        : `${d.field}: ${d.from === null || d.from === '' ? '—' : d.from} → ${d.to === null || d.to === '' ? '—' : d.to}`).join(' · ')}
+                      {c.diffs.filter((d) => d.field === 'cover').map((d) => (
+                        <img key={d.to} src={d.to} alt="" style={{ width: 60, height: 90, objectFit: 'cover', borderRadius: 4, marginLeft: 8, verticalAlign: 'middle' }} onError={(e) => { e.target.style.display = 'none' }} />
+                      ))}
                     </div>
                   ))}
                   {catalogPreview.changes.length > 20 && <p className="progress">…and {catalogPreview.changes.length - 20} more.</p>}
@@ -1924,10 +2254,12 @@ export default function App() {
                   </div>
                 )}
                 {detail.cbrUnsupported && (
-                  <div className="error">
-                    <strong>CBR cannot be opened yet.</strong> CBR is a RAR archive, not a zip, and there is no reliable browser RAR unpacker bundled here.
-                    Convert it to CBZ (a zip of images) — for example with 7-Zip, or in Calibre — then import the CBZ instead. This file is kept in your library so you can find it, but it will not open as a comic.
+                  <div className="progress">
+                    This CBR was imported before CBR opening was added. Opening it re-reads the archive with the new unpacker and updates this book — nothing to convert by hand.
                   </div>
+                )}
+                {detail.format === 'audio' && detail.audioParts && detail.audioParts.length > 1 && (
+                  <p>Multi-part audiobook: {detail.audioParts.length} parts, played in order with one combined position.</p>
                 )}
                 {detail.format === 'audio' && (
                   <p>Duration: {detail.metadata.durationSec ? formatTime(detail.metadata.durationSec) : 'Unknown'} · Chapters: {detail.audioChapters && detail.audioChapters.length ? detail.audioChapters.length : 'None embedded — bookmarks work instead'}</p>
@@ -1944,11 +2276,11 @@ export default function App() {
                   {detail.format === 'epub' && <button onClick={() => openReader(detail)}>Read</button>}
                   {detail.format === 'epub' && detailPair && <button className="secondary" onClick={() => openReadAlong(detail)}>🎧 Read along</button>}
                   {detail.format === 'pdf' && <button onClick={() => openViewer(detail, 'pdf')}>Open PDF</button>}
-                  {detail.format === 'comic' && !detail.cbrUnsupported && <button onClick={() => openViewer(detail, 'comic')}>Open comic</button>}
+                  {detail.format === 'comic' && <button onClick={() => openViewer(detail, 'comic')}>Open comic</button>}
                   {detail.format === 'audio' && <button onClick={() => openViewer(detail, 'audio')}>Play audiobook</button>}
                   {detail.format === 'audio' && detailPair && <button className="secondary" onClick={() => openReadAlong(detail)}>🎧 Read along</button>}
                   {detail.format === 'epub' && <button className="secondary" onClick={() => exportBook(detail)} disabled={exporting}>{exporting ? 'Exporting…' : 'Download corrected EPUB'}</button>}
-                  <button className="secondary" onClick={async () => { if (confirm('Remove this book from ShelfSort?')) { await deleteBook(detail.id); setView('library'); await reload() } }}>Remove</button>
+                  <button className="secondary" onClick={async () => { if (confirm('Remove this book from ShelfSort?')) { if (detail.audioParts) for (const p of detail.audioParts) await deleteBookFile(p.partId); await deleteBook(detail.id); setView('library'); await reload() } }}>Remove</button>
                 </div>
                 {(detail.format === 'epub' || detail.format === 'audio') && (
                   <div className="field">
@@ -1996,6 +2328,12 @@ export default function App() {
               <input type="checkbox" checked={autoApplyHigh} onChange={(e) => setAutoApplyHigh(e.target.checked)} />
               Auto-apply high-confidence fixes (only ask when unsure) — turn off to ask every time
             </label>
+            <div className="toolbar">
+              <button className="secondary" onClick={() => runEnrichment('covers')} disabled={enriching || !books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length}>
+                {enriching ? 'Checking…' : `Find missing covers (${books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length})`}
+              </button>
+            </div>
+            <p className="progress">“Find missing covers” scans only books with no cover and proposes covers only — never other fields, never overwriting a cover you already have.</p>
             {autoFixedSummary.length > 0 && (
               <div className="card">
                 <h3>✓ Auto-fixed (high confidence only)</h3>
@@ -2007,9 +2345,32 @@ export default function App() {
                 ))}
               </div>
             )}
-            <p className="progress">Nothing in the review list below is applied until you press Apply. Edit any proposed value before applying it.</p>
-            {proposals.length > 0 && <button onClick={applyAllProposals}>Apply all proposed fixes</button>}
-            {proposals.map((p) => {
+            <p className="progress">Nothing in the review list below is applied until you press Apply. Edit any proposed value before applying it.{coverReview && proposals.length > 0 ? ' Covers below are shown as thumbnails so you can eyeball them before applying — a wrong-edition cover can be corrected later from the book\'s detail page “Edit metadata”.' : ''}</p>
+            {proposals.length > 0 && <button onClick={applyAllProposals}>{coverReview ? 'Apply all covers' : 'Apply all proposed fixes'}</button>}
+            {coverReview && proposals.filter((p) => (edits[p.bookId] || p.proposals).coverUrl).length > 0 && (
+              <div className="cover-grid" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 12, marginTop: 12 }}>
+                {proposals.filter((p) => (edits[p.bookId] || p.proposals).coverUrl).map((p) => {
+                  const book = books.find((b) => b.id === p.bookId)
+                  if (!book) return null
+                  const values = edits[p.bookId] || p.proposals
+                  return (
+                    <div className="card" key={p.bookId} style={{ margin: 0 }}>
+                      {values.coverUrl
+                        ? <img src={values.coverUrl} alt="" style={{ width: '100%', aspectRatio: '2/3', objectFit: 'cover', borderRadius: 4 }} onError={(e) => { e.target.style.display = 'none' }} />
+                        : <div className="cover">No preview</div>}
+                      <strong style={{ display: 'block', marginTop: 6 }}>{book.metadata.title}</strong>
+                      <span className="progress" style={{ display: 'block' }}>{book.metadata.author || 'Unknown author'}</span>
+                      <span className="progress" style={{ display: 'block' }}>{p.source} · {p.isbnMatch ? 'ISBN match' : 'Title+author match'} · {p.confidence}</span>
+                      <div className="toolbar" style={{ marginTop: 6 }}>
+                        <button onClick={() => applyProposal(p.bookId, values)}>Apply</button>
+                        <button className="secondary" onClick={() => setProposals((prev) => prev.filter((x) => x.bookId !== p.bookId))}>Dismiss</button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {!(coverReview && proposals.filter((p) => (edits[p.bookId] || p.proposals).coverUrl).length) && proposals.map((p) => {
               const book = books.find((b) => b.id === p.bookId)
               if (!book) return null
               const values = edits[p.bookId] || p.proposals
@@ -2118,12 +2479,12 @@ export default function App() {
         )}
 
         {view === 'pdf' && selected && <PdfViewer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); await reload() }} />}
-        {view === 'comic' && selected && <ComicViewer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); await reload() }} />}
+        {view === 'comic' && selected && <ComicViewer book={withFile(selected)} mangaDefault={mangaDefault} webtoonDefault={webtoonDefault} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); await reload() }} onMigrate={async (book, metadata) => { const { file: _f, ...u } = { ...book, metadata, cbrUnsupported: false }; await putBookMeta(u); setSelected(u); await reload(); return u }} />}
         {view === 'audio' && selected && <AudioPlayer book={withFile(selected)} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); setSelected(u); }} readAlongPair={linkedPairFor(selected)} onReadAlong={() => openReadAlong(selected)} />}
         {view === 'readalong' && selected && <ReadAlongView epubBook={detailPair ? withFile(detailPair.epub) : withFile(selected)} audioBook={detailPair ? withFile(detailPair.audio) : null} books={books} onBack={() => setView('detail')} onSave={async (book, progress) => { const { file: _f, ...u } = { ...book, progress }; await putBookMeta(u); }} />}
       </main>
 
-      {['library', 'series', 'series-detail', 'unsorted'].includes(view) && (
+      {['library', 'series', 'series-detail', 'authors', 'author-detail', 'unsorted'].includes(view) && (
         <nav className="bottom-tabs" aria-label="Format">
           {[
             { key: 'all', label: 'All', icon: '📚', count: books.length },
@@ -2343,85 +2704,250 @@ function PdfViewer({ book, onBack, onSave }) {
   )
 }
 
-function ComicViewer({ book, onBack, onSave }) {
+function ComicViewer({ book, mangaDefault, webtoonDefault, onBack, onSave, onMigrate }) {
   const [pages, setPages] = useState([])
-  const [page, setPage] = useState(0)
+  // displayPage is the position IN READING ORDER (what the footer
+  // shows: "Page N of total"). Progress is saved as the ARCHIVE
+  // index instead, so toggling manga mode never moves the bookmark:
+  //   archiveIndex = manga ? (total - 1 - displayPage) : displayPage
+  //   displayPage  = manga ? (total - 1 - archiveIndex) : archiveIndex
+  const [displayPage, setDisplayPage] = useState(0)
   const [fit, setFit] = useState('width')
   const [status, setStatus] = useState('Loading comic…')
+  // Per-comic modes, remembered on the book's progress. A saved
+  // per-comic choice wins over the Settings defaults; the defaults
+  // apply only when the book has no saved choice yet.
+  const [manga, setManga] = useState(() => (book.progress && typeof book.progress.manga === 'boolean') ? book.progress.manga : !!mangaDefault)
+  const [webtoon, setWebtoon] = useState(() => (book.progress && typeof book.progress.webtoon === 'boolean') ? book.progress.webtoon : !!webtoonDefault)
   const urlsRef = useRef([])
+  const touchRef = useRef(null)
+  const webtoonRef = useRef(null)
+  const scrollTimerRef = useRef(null)
+  const mangaRef = useRef(manga)
+  const webtoonRefState = useRef(webtoon)
+  mangaRef.current = manga
+  webtoonRefState.current = webtoon
+  const total = pages.length
+  const archiveIndexOf = (disp) => (manga ? total - 1 - disp : disp)
+  const displayIndexOf = (arch) => (manga ? total - 1 - arch : arch)
+
+  function saveProgressFor(disp) {
+    if (!total) return
+    onSave(book, { page: archiveIndexOf(disp), manga: mangaRef.current, webtoon: webtoonRefState.current, at: Date.now() })
+  }
+
+  function goToDisplay(i) {
+    if (i < 0 || i >= total) return
+    setDisplayPage(i)
+    saveProgressFor(i)
+  }
+
+  // MANGA SWIPE/TAP MAPPING (documented, Kuro-style):
+  //   LTR (normal): swipe LEFT = next page, swipe RIGHT = previous;
+  //                 tap RIGHT third = next, tap LEFT third = previous.
+  //   RTL (manga):  swipe RIGHT = next page in reading order, swipe
+  //                 LEFT = previous; tap LEFT third = next, tap RIGHT
+  //                 third = previous. The next page in a manga sits on
+  //                 the LEFT, so you move toward the left to advance —
+  //                 which is why both the swipe and the tap zone flip.
+  // The middle third never turns a page (it would fight with
+  // scrolling/zooming). A drag over 40px counts as a swipe; a
+  // shorter touch counts as a tap. One-page mode only — webtoon
+  // scrolls instead, so it has no swipe/tap page turns.
+  function onTouchStart(e) {
+    if (webtoon || total < 2) return
+    const t = e.touches[0]
+    touchRef.current = { x: t.clientX, y: t.clientY, time: Date.now() }
+  }
+  function onTouchEnd(e) {
+    if (webtoon || !touchRef.current) return
+    const start = touchRef.current
+    touchRef.current = null
+    const t = e.changedTouches[0]
+    const dx = t.clientX - start.x
+    const dy = t.clientY - start.y
+    if (Math.abs(dx) > 40 && Math.abs(dx) > Math.abs(dy)) {
+      // Swipe. RTL flips the direction: rightward = forward.
+      const forward = manga ? dx > 0 : dx < 0
+      goToDisplay(displayPage + (forward ? 1 : -1))
+      return
+    }
+    if (Math.abs(dx) < 12 && Math.abs(dy) < 12) {
+      // Tap: divide the page into thirds by touch position.
+      const rect = e.currentTarget.getBoundingClientRect()
+      const relX = (t.clientX - rect.left) / Math.max(1, rect.width)
+      if (relX < 0.33) goToDisplay(displayPage + (manga ? 1 : -1))
+      else if (relX > 0.67) goToDisplay(displayPage + (manga ? -1 : 1))
+    }
+  }
+
+  // Webtoon: on scroll-stop, save the page nearest the top as the
+  // resume point (archive index, like one-page mode).
+  function onWebtoonScroll() {
+    if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current)
+    scrollTimerRef.current = setTimeout(() => {
+      const container = webtoonRef.current
+      if (!container || !total) return
+      const imgs = container.querySelectorAll('[data-display-index]')
+      const top = container.getBoundingClientRect().top
+      let nearest = 0
+      let nearestDist = Infinity
+      imgs.forEach((img) => {
+        const dist = Math.abs(img.getBoundingClientRect().top - top)
+        if (dist < nearestDist) { nearestDist = dist; nearest = Number(img.getAttribute('data-display-index')) }
+      })
+      saveProgressFor(nearest)
+    }, 300)
+  }
 
   useEffect(() => {
     let cancelled = false
     if (!book.file) { setStatus('Loading comic…'); return () => { cancelled = true } }
     ;(async () => {
       try {
-        const names = book.metadata.pageNames || []
-        const urls = []
-        for (const name of names) {
-          const blob = await getCbzPageBlob(book.file, name)
-          urls.push({ name, url: URL.createObjectURL(blob) })
+        let meta = book.metadata
+        // MIGRATION for books imported before CBR/CBT/CB7 support:
+        // they carry cbrUnsupported (or no pageNames at all). Re-parse
+        // the stored blob with the new unpacker, save the fresh
+        // metadata (series, cover, page list), and open the viewer —
+        // never a fake open, and a failed re-parse is a clear error
+        // that stays on this screen instead of a broken viewer.
+        if (book.cbrUnsupported || !(meta.pageNames && meta.pageNames.length)) {
+          setStatus('Re-reading this archive with the new unpacker…')
+          const parsed = await parseComic(book.file, book.fileName)
+          if (onMigrate) {
+            const updated = await onMigrate(book, parsed)
+            if (updated) meta = updated.metadata
+          } else meta = parsed
         }
-        if (cancelled) { urls.forEach((u) => URL.revokeObjectURL(u.url)); return }
+        const names = meta.pageNames || []
+        const loaded = await loadComicPages(book.file, names, book.fileName)
+        if (cancelled) return
+        const urls = loaded.map(({ name, blob }) => ({ name, url: URL.createObjectURL(blob) }))
         urlsRef.current = urls
         setPages(urls)
         const saved = book.progress
-        if (saved && saved.page >= 0 && saved.page < urls.length) setPage(saved.page)
+        const arch = saved && typeof saved.page === 'number' && saved.page >= 0 && saved.page < urls.length ? saved.page : 0
+        setDisplayPage(mangaRef.current ? urls.length - 1 - arch : arch)
         setStatus('')
       } catch (e) {
-        setStatus(`Could not open comic: ${e.message}`)
+        if (!cancelled) setStatus(`Could not open comic: ${e.message}`)
       }
     })()
-    return () => { cancelled = true; urlsRef.current.forEach((u) => URL.revokeObjectURL(u.url)); urlsRef.current = [] }
+    return () => {
+      cancelled = true
+      urlsRef.current.forEach((u) => URL.revokeObjectURL(u.url))
+      urlsRef.current = []
+      if (scrollTimerRef.current) clearTimeout(scrollTimerRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [book.id, book.file])
 
-  function goTo(i) {
-    if (i < 0 || i >= pages.length) return
-    setPage(i)
-    onSave(book, { page: i, at: Date.now() })
-  }
+  // Reopening a webtoon resumes near the saved page once loaded.
+  useEffect(() => {
+    if (!webtoon || !total) return
+    const container = webtoonRef.current
+    if (!container) return
+    const el = container.querySelector(`[data-display-index="${displayPage}"]`)
+    if (el) el.scrollIntoView({ block: 'start' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [webtoon, total])
 
-  if (book.cbrUnsupported) {
-    return (
-      <div className="card">
-          <h2>{book.metadata.title}</h2>
-        <div className="error">
-          <strong>CBR cannot be opened yet.</strong> CBR is a RAR archive, not a zip, and no reliable browser RAR unpacker is bundled here.
-          Convert it to CBZ with 7-Zip or Calibre, then import the CBZ instead.
-        </div>
-      </div>
-    )
-  }
+  // The pages array is in ARCHIVE order; the page shown is the
+  // archive page at this reading-order position (in manga mode
+  // that is the mirror index — see archiveIndexOf above).
+  const current = total ? pages[archiveIndexOf(displayPage)] : undefined
 
   return (
     <div className="card viewer">
       <h2>{book.metadata.title}</h2>
       <div className="toolbar">
-        <button className="secondary" disabled={page <= 0} onClick={() => goTo(page - 1)}>← Previous page</button>
-        <span>Page {pages.length ? page + 1 : '…'} of {pages.length}</span>
-        <button className="secondary" disabled={page >= pages.length - 1} onClick={() => goTo(page + 1)}>Next page →</button>
-        <button className="secondary" onClick={() => setFit(fit === 'width' ? 'page' : 'width')}>Fit: {fit === 'width' ? 'width' : 'page'}</button>
+        <button className="secondary" disabled={webtoon || displayPage <= 0} onClick={() => goToDisplay(displayPage - 1)}>← Previous page</button>
+        <span>Page {total ? displayPage + 1 : '…'} of {total}{manga ? ' · right-to-left' : ''}{webtoon ? ' · webtoon' : ''}</span>
+        <button className="secondary" disabled={webtoon || displayPage >= total - 1} onClick={() => goToDisplay(displayPage + 1)}>Next page →</button>
+        <button className="secondary" disabled={webtoon} onClick={() => setFit(fit === 'width' ? 'page' : 'width')}>Fit: {fit === 'width' ? 'width' : 'page'}</button>
+      </div>
+      <div className="toolbar">
+        <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input type="checkbox" checked={manga} onChange={(e) => {
+            const next = e.target.checked
+            // Keep the same ARCHIVE page bookmarked across the flip:
+            // convert the current display page to archive, flip the
+            // mode, then convert back — the book does not jump.
+            const arch = archiveIndexOf(displayPage)
+            setManga(next)
+            mangaRef.current = next
+            setDisplayPage(next ? total - 1 - arch : arch)
+            onSave(book, { page: arch, manga: next, webtoon: webtoonRefState.current, at: Date.now() })
+          }} />
+          Manga mode (right-to-left)
+        </label>
+        <label className="progress" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <input type="checkbox" checked={webtoon} onChange={(e) => {
+            const next = e.target.checked
+            setWebtoon(next)
+            webtoonRefState.current = next
+            saveProgressFor(displayPage)
+          }} />
+          Webtoon mode (vertical strip)
+        </label>
       </div>
       {status && <p className="progress">{status}</p>}
-      {pages[page] && (
-        <img src={pages[page].url} alt={`Page ${page + 1}`} className={fit === 'width' ? 'comic-page fit-width' : 'comic-page fit-page'} />
+      {webtoon ? (
+        <div className="comic-webtoon" ref={webtoonRef} onScroll={onWebtoonScroll}>
+          {pages.map((p, i) => {
+            const arch = manga ? total - 1 - i : i
+            return <img key={p.name} data-display-index={i} src={pages[arch].url} alt={`Page ${i + 1}`} className="comic-page fit-width" />
+          })}
+        </div>
+      ) : (
+        current && (
+          <div onTouchStart={onTouchStart} onTouchEnd={onTouchEnd}>
+            <img src={current.url} alt={`Page ${displayPage + 1}`} className={fit === 'width' ? 'comic-page fit-width' : 'comic-page fit-page'} />
+          </div>
+        )
       )}
-      {pages.length > 1 && (
+      {!webtoon && total > 1 && (
         <div className="thumb-strip">
-          {pages.map((p, i) => (
-            <button key={p.name} className={i === page ? 'thumb active' : 'thumb'} onClick={() => goTo(i)} aria-label={`Go to page ${i + 1}`}>
-              <img src={p.url} alt="" loading="lazy" />
-              <span>{i + 1}</span>
-            </button>
-          ))}
+          {pages.map((p, i) => {
+            // Thumbnails follow READING order (display order), so in
+            // manga mode the strip runs right-to-left too.
+            const arch = manga ? total - 1 - i : i
+            const thumb = pages[arch]
+            return (
+              <button key={p.name} className={i === displayPage ? 'thumb active' : 'thumb'} onClick={() => goToDisplay(i)} aria-label={`Go to page ${i + 1}`}>
+                <img src={thumb.url} alt="" loading="lazy" />
+                <span>{i + 1}</span>
+              </button>
+            )
+          })}
         </div>
       )}
     </div>
   )
 }
 
+
 function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
-  const [current, setCurrent] = useState(0)
-  const [duration, setDuration] = useState(book.metadata.durationSec || 0)
+  // ---- Parts -------------------------------------------------------
+  // A single-file book has no audioParts: it is exactly one part
+  // derived from the book itself, so single-file behaviour (play,
+  // seek, save, display) is byte-for-byte identical to before and
+  // no part UI is shown. A multi-part book's audioParts were built
+  // at import (see importFiles + src/lib/multipart.js): each part
+  // keeps its own fileName, its own import-time stored URI (true
+  // extension preserved), and its own durationSec where known.
+  const parts = useMemo(() => {
+    if (book.audioParts && book.audioParts.length) return book.audioParts
+    return [{ partId: book.id, fileName: book.fileName, audioFileUri: book.audioFileUri || null, durationSec: book.metadata.durationSec || null }]
+  }, [book])
+  const isMulti = parts.length > 1
+  const initialDurations = useMemo(() => parts.map((p) => p.durationSec || null), [parts])
+
+  // ---- State -------------------------------------------------------
+  const [current, setCurrent] = useState(0) // GLOBAL position (sec)
+  const [partDurations, setPartDurations] = useState(initialDurations)
+  const [partIndex, setPartIndex] = useState(() => resumeForSaved(book.progress, initialDurations).partIndex)
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState(1)
   const [sleepMin, setSleepMin] = useState(0)
@@ -2434,91 +2960,175 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
   const sleepTimerRef = useRef(null)
   const lastSavedRef = useRef(0)
   const currentRef = useRef(0)
+  const partIndexRef = useRef(partIndex)
   const chapterRef = useRef(0)
   const bookmarksRef = useRef(bookmarks)
   const ctrlRef = useRef(null)
   const bookRef = useRef(book)
+  const partDurationsRef = useRef(partDurations)
+  const startOffsetRef = useRef(resumeForSaved(book.progress, initialDurations).offsetInPart)
+  const autoplayRef = useRef(false)
+  const chaptersRef = useRef([])
   bookRef.current = book
   bookmarksRef.current = bookmarks
+  partIndexRef.current = partIndex
+  partDurationsRef.current = partDurations
 
-  function saveProgress(pos, chap) {
-    const progress = { positionSec: pos, chapterIndex: chap, bookmarks: bookmarksRef.current, at: Date.now() }
+  // Global totals. knownTotal = sum of KNOWN part durations; when
+  // every part's duration is known it is the true total. An MP3
+  // part's duration is unknown until it plays, so the total GROWS
+  // as parts report theirs — the UI shows remaining with a '+'
+  // while the total is incomplete, never presenting a partial
+  // total as final (see the seek row below).
+  const knownTotal = partDurations.reduce((a, d) => (typeof d === 'number' && d > 0 ? a + d : a), 0)
+  const totalComplete = partDurations.every((d) => typeof d === 'number' && d > 0)
+  const total = knownTotal
+  const remaining = Math.max(0, total - current)
+  // Chapters: the stored list is authoritative. For a single-part
+  // book it is that file's chapters, unchanged. For a multi-part
+  // book it is the GLOBAL list built at import (each part's
+  // chapters shifted by its start offset, parts after an
+  // unknown-duration part omitted, never faked — see multipart.js).
+  // Playback never re-derives it, so it cannot double-shift.
+  const chs = book.audioChapters || []
+  chaptersRef.current = chs
+
+  function saveProgress(pos, partIdx, chap) {
+    const progress = { positionSec: pos, partIndex: partIdx, chapterIndex: chap, bookmarks: bookmarksRef.current, at: Date.now() }
     onSave(bookRef.current, progress)
   }
   const saveProgressRef = useRef(saveProgress)
   saveProgressRef.current = saveProgress
 
-  // Create the controller once per book. Native on Android (Playlist /
-  // ExoPlayer + MediaSession, background + notification controls),
-  // HTML <audio> on web or if native setup fails. The controller is
-  // NOT paused on unmount: that is the point of a native player —
-  // backing out to the library/detail keeps playing in the background.
+  // ---- Controller per part -----------------------------------------
+  // The controller surface is single-track (one Playlist item, one
+  // <audio> element), so multi-part playback is a track manager on
+  // top of it: one controller per part, created when the part
+  // starts, destroyed when it ends or the user jumps parts. On a
+  // part's natural end the next part starts automatically (and
+  // keeps playing if playback was playing — it always is at a
+  // natural end). Cross-part seeks and part buttons reuse the same
+  // path: set the start offset, flip partIndex, let this effect
+  // build the new controller. No gap handling beyond a normal
+  // track change — that is the documented behaviour, not a bug.
+  // The controller is NOT paused on unmount: native background
+  // playback keeps going after leaving this screen, as before.
   // The final position is saved on unmount via the refs above.
   useEffect(() => {
     let cancelled = false
     let ctrl = null
     setLoading(true)
     setPlayerError('')
-    const saved = book.progress
-    const startPos = saved && saved.positionSec ? saved.positionSec : 0
-    currentRef.current = startPos
-    lastSavedRef.current = startPos
-    setCurrent(startPos)
-    createAudioController({
-      book,
-      fileBuf: book.file,
-      startPosition: startPos,
-      pauseOnDestroy: false,
-      cbs: {
-        onPosition: (pos, dur) => {
-          if (cancelled) return
-          currentRef.current = pos
-          setCurrent(pos)
-          if (dur > 0) setDuration(dur)
-          const chapters = book.audioChapters || []
-          if (chapters.length) {
-            let idx = 0
-            for (let i = 0; i < chapters.length; i++) if (chapters[i].start <= pos + 0.5) idx = i
-            if (idx !== chapterRef.current) { chapterRef.current = idx; setChapterIndex(idx) }
-          }
-          if (Math.abs(pos - lastSavedRef.current) > 5) {
-            lastSavedRef.current = pos
-            saveProgressRef.current(pos, chapterRef.current)
-          }
-        },
-        onPlaying: (p) => { if (!cancelled) setPlaying(p) },
-        onEnded: () => { if (!cancelled) setPlaying(false) },
-        onError: () => { if (!cancelled) setPlayerError('Playback reported an error. Try pressing play again, or re-import the file.') },
-      },
-    }).then((c) => {
-      if (cancelled) { c.destroy(); return }
-      ctrl = c
-      ctrlRef.current = c
-      setPlayerMode(c.mode)
-      if (c.fallbackFromNative) setPlayerError('Native player was unavailable, so this is playing with the in-app player (no background playback).')
-      setLoading(false)
-    }).catch(() => {
-      if (!cancelled) { setPlayerError('Could not start playback for this file.'); setLoading(false) }
-    })
+    const part = parts[partIndex]
+    const startPos = startOffsetRef.current || 0
+    startOffsetRef.current = 0
+    const sums = knownSums(partDurationsRef.current)
+    currentRef.current = sums[partIndex] + startPos
+    lastSavedRef.current = currentRef.current
+    setCurrent(currentRef.current)
+    ;(async () => {
+      let fileBuf = null
+      if (!part.audioFileUri) {
+        try { fileBuf = await getBookFile(part.partId) } catch { /* fall through to book.file */ }
+        if (!fileBuf && book.file) fileBuf = book.file
+      }
+      const partBook = {
+        id: part.partId,
+        fileName: part.fileName,
+        metadata: book.metadata,
+        audioFileUri: part.audioFileUri || null,
+      }
+      try {
+        const c = await createAudioController({
+          book: partBook,
+          fileBuf,
+          startPosition: startPos,
+          pauseOnDestroy: false,
+          cbs: {
+            onPosition: (pos, dur) => {
+              if (cancelled) return
+              const idx = partIndexRef.current
+              if (dur > 0 && partDurationsRef.current[idx] !== dur) {
+                setPartDurations((prev) => {
+                  const next = [...prev]
+                  next[idx] = dur
+                  return next
+                })
+              }
+              const global = knownSums(partDurationsRef.current)[idx] + pos
+              currentRef.current = global
+              setCurrent(global)
+              const chs = chaptersRef.current
+              if (chs.length) {
+                let ci = 0
+                for (let i = 0; i < chs.length; i++) if (chs[i].start <= global + 0.5) ci = i
+                if (ci !== chapterRef.current) { chapterRef.current = ci; setChapterIndex(ci) }
+              }
+              if (Math.abs(global - lastSavedRef.current) > 5) {
+                lastSavedRef.current = global
+                saveProgressRef.current(global, idx, chapterRef.current)
+              }
+            },
+            onPlaying: (p) => { if (!cancelled) setPlaying(p) },
+            onEnded: () => {
+              if (cancelled) return
+              const idx = partIndexRef.current
+              if (idx < parts.length - 1) {
+                // Advance to the next part, still playing.
+                autoplayRef.current = true
+                startOffsetRef.current = 0
+                setPartIndex(idx + 1)
+              } else {
+                setPlaying(false)
+              }
+            },
+            onError: () => { if (!cancelled) setPlayerError('Playback reported an error. Try pressing play again, or re-import the file.') },
+          },
+        })
+        if (cancelled) { c.destroy(); return }
+        ctrl = c
+        ctrlRef.current = c
+        setPlayerMode(c.mode)
+        if (c.fallbackFromNative) setPlayerError('Native player was unavailable, so this is playing with the in-app player (no background playback).')
+        if (autoplayRef.current) { autoplayRef.current = false; c.play() }
+        setLoading(false)
+      } catch {
+        if (!cancelled) { setPlayerError('Could not start playback for this file.'); setLoading(false) }
+      }
+    })()
     return () => {
       cancelled = true
-      // Save wherever playback had reached, even if it kept playing
-      // in the background after this screen unmounted.
-      if (currentRef.current > 0) saveProgressRef.current(currentRef.current, chapterRef.current)
+      if (currentRef.current > 0) saveProgressRef.current(currentRef.current, partIndexRef.current, chapterRef.current)
       if (ctrl) ctrl.destroy()
       else if (ctrlRef.current) ctrlRef.current.destroy()
       ctrlRef.current = null
       if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [book.id])
+  }, [book.id, partIndex])
 
-  function seekTo(sec) {
-    const target = Math.max(0, Math.min(duration || sec, sec))
+  // ---- Seeking (GLOBAL) --------------------------------------------
+  function seekToGlobal(sec) {
+    const target = Math.max(0, total > 0 ? Math.min(total, sec) : sec)
+    const { partIndex: idx, offsetInPart } = mapGlobalToPart(target, partDurationsRef.current)
+    const chs = chaptersRef.current
+    let ci = 0
+    for (let i = 0; i < chs.length; i++) if (chs[i].start <= target + 0.5) ci = i
+    chapterRef.current = ci
+    setChapterIndex(ci)
     currentRef.current = target
     setCurrent(target)
-    ctrlRef.current && ctrlRef.current.seekTo(target)
-    saveProgress(target, chapterRef.current)
+    saveProgress(target, idx, ci)
+    if (idx !== partIndexRef.current) {
+      // Cross-part seek: rebuild the controller on the new part.
+      // Keep the playing state: a seek while playing resumes
+      // playing on the new part; a seek while paused stays paused.
+      autoplayRef.current = playing
+      startOffsetRef.current = offsetInPart
+      setPartIndex(idx)
+    } else if (ctrlRef.current) {
+      ctrlRef.current.seekTo(offsetInPart)
+    }
   }
 
   function togglePlay() {
@@ -2532,9 +3142,6 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
     if (sleepTimerRef.current) clearTimeout(sleepTimerRef.current)
     if (!min) { setSleepLeft(0); return }
     setSleepLeft(min * 60)
-    // Sleep timer lives in this screen only: if the user leaves the
-    // player, the timer is cleared on unmount (native background
-    // playback itself keeps going, but no timer is left running).
     sleepTimerRef.current = setTimeout(() => {
       if (ctrlRef.current) ctrlRef.current.pause()
       setPlaying(false)
@@ -2547,34 +3154,76 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
     const next = [...bookmarks, { time: Math.floor(currentRef.current), label: `Bookmark ${formatTime(currentRef.current)}` }]
     setBookmarks(next)
     bookmarksRef.current = next
-    onSave(book, { positionSec: currentRef.current, chapterIndex: chapterRef.current, bookmarks: next, at: Date.now() })
+    onSave(book, { positionSec: currentRef.current, partIndex: partIndexRef.current, chapterIndex: chapterRef.current, bookmarks: next, at: Date.now() })
   }
 
-  const chapters = book.audioChapters || []
+  function seekChapter(delta) {
+    const chs = chaptersRef.current
+    if (!chs.length) return
+    if (delta > 0) {
+      const next = chs.find((c) => c.start > currentRef.current + 1)
+      if (next) seekToGlobal(next.start)
+    } else {
+      let prev = null
+      for (const c of chs) if (c.start < currentRef.current - 1) prev = c
+      if (prev) seekToGlobal(prev.start)
+      else seekToGlobal(0)
+    }
+  }
+
+  function seekPart(delta) {
+    if (!isMulti) return
+    const idx = partIndexRef.current + delta
+    if (idx < 0 || idx >= parts.length) return
+    autoplayRef.current = playing
+    startOffsetRef.current = 0
+    const target = knownSums(partDurationsRef.current)[idx]
+    currentRef.current = target
+    setCurrent(target)
+    saveProgress(target, idx, chapterRef.current)
+    setPartIndex(idx)
+  }
+
+  const cover = book.metadata.coverDataUrl || book.metadata.coverUrl || ''
   return (
-    <div className="card viewer">
-      <h2>🎧 {book.metadata.title}</h2>
+    <div className="card viewer audio-player-dark">
+      <h2>{book.metadata.title}</h2>
       <p>{book.metadata.author || 'Unknown author'}</p>
+      {isMulti && <p className="progress">Part {partIndex + 1} of {parts.length} · {parts[partIndex].fileName}</p>}
       {playerMode === 'native' && <p className="progress">Native player — keeps playing in the background, with lock-screen / notification controls.</p>}
       {playerMode === 'html' && <p className="progress">In-app player (web fallback).</p>}
       {loading && <p className="progress">Loading audio…</p>}
       {playerError && <p className="error">{playerError}</p>}
-      <div className="audio-controls">
-        <input type="range" min="0" max={duration || 0} step="1" value={Math.min(current, duration || 0)} onChange={(e) => seekTo(Number(e.target.value))} />
-        <div className="toolbar">
-          <span>{formatTime(current)} / {formatTime(duration)}</span>
-          <button className="secondary" onClick={() => seekTo(current - 15)}>−15s</button>
-          <button className="secondary" onClick={() => seekTo(current - 30)}>−30s</button>
+      <div className="audio-player-main">
+        <div className="audio-cover-wrap" onClick={togglePlay} role="button" aria-label={playing ? 'Pause' : 'Play'}>
+          {cover
+            ? <img src={cover} alt="" className="audio-cover" />
+            : <div className="audio-cover audio-cover-placeholder">🎧</div>}
+          <button className="audio-cover-play" onClick={(e) => { e.stopPropagation(); togglePlay() }} disabled={loading} aria-label={playing ? 'Pause' : 'Play'}>
+            {playing ? '⏸' : '▶'}
+          </button>
+        </div>
+        <div className="audio-seek">
+          <input type="range" min="0" max={Math.max(total, current)} step="1" value={Math.min(current, Math.max(total, current))} onChange={(e) => seekToGlobal(Number(e.target.value))} />
+          <div className="audio-times">
+            <span>{formatTime(current)}</span>
+            <span>{total > 0 ? `-${formatTime(remaining)}${totalComplete ? '' : '+'}` : '—'}</span>
+          </div>
+          {!totalComplete && total > 0 && <p className="progress">Total still growing: an MP3 part's length is not known until it plays, so the remaining time is a lower bound for now.</p>}
+        </div>
+        <div className="toolbar audio-skip-row">
+          <button className="secondary" onClick={() => seekToGlobal(current - 60)}>−1m</button>
+          <button className="secondary" onClick={() => seekToGlobal(current - 10)}>−10s</button>
           <button onClick={togglePlay} disabled={loading}>{playing ? '⏸ Pause' : '▶ Play'}</button>
-          <button className="secondary" onClick={() => seekTo(current + 15)}>+15s</button>
-          <button className="secondary" onClick={() => seekTo(current + 30)}>+30s</button>
-          <label>Speed
-            <select value={speed} onChange={(e) => { const s = Number(e.target.value); setSpeed(s); if (ctrlRef.current) ctrlRef.current.setRate(s) }}>
-              {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((s) => <option key={s} value={s}>{s}×</option>)}
-            </select>
-          </label>
+          <button className="secondary" onClick={() => seekToGlobal(current + 10)}>+10s</button>
+          <button className="secondary" onClick={() => seekToGlobal(current + 60)}>+1m</button>
         </div>
         <div className="toolbar">
+          <label>Speed
+            <select value={speed} onChange={(e) => { const s = Number(e.target.value); setSpeed(s); if (ctrlRef.current) ctrlRef.current.setRate(s) }}>
+              {[0.5, 0.75, 1, 1.25, 1.5, 1.75, 2].map((s) => <option key={s} value={s}>{s.toFixed(1)}x</option>)}
+            </select>
+          </label>
           <label>Sleep timer
             <select value={sleepMin} onChange={(e) => setSleep(Number(e.target.value))}>
               <option value={0}>Off</option>
@@ -2585,33 +3234,38 @@ function AudioPlayer({ book, onBack, onSave, readAlongPair, onReadAlong }) {
           </label>
           {sleepLeft > 0 && <span className="progress">Sleep timer set ({sleepMin} min)</span>}
           <button className="secondary" onClick={addBookmark}>🔖 Bookmark at {formatTime(current)}</button>
+          <button className="secondary" disabled={!chs.length} onClick={() => seekChapter(-1)}>⏮ Chapter</button>
+          <button className="secondary" disabled={!chs.length} onClick={() => seekChapter(1)}>Chapter ⏭</button>
+          {isMulti && <button className="secondary" disabled={partIndex <= 0} onClick={() => seekPart(-1)}>⏮ Part</button>}
+          {isMulti && <button className="secondary" disabled={partIndex >= parts.length - 1} onClick={() => seekPart(1)}>Part ⏭</button>}
           {readAlongPair && <button onClick={onReadAlong}>🎧 Read along with EPUB</button>}
         </div>
       </div>
-      {chapters.length > 0 ? (
-        <div>
-          <h3>Chapters {chapters.length ? `(${chapters.length})` : ''}</h3>
-          {chapters.map((ch, i) => (
+      {chs.length > 0 ? (
+        <details open>
+          <summary><h3 style={{ display: 'inline' }}>Chapters ({chs.length})</h3></summary>
+          {chs.map((ch, i) => (
             <div key={i} className={i === chapterIndex ? 'chapter-row active' : 'chapter-row'}>
-              <button className="secondary" onClick={() => seekTo(ch.start)}>{ch.title}</button>
+              <button className="secondary" onClick={() => seekToGlobal(ch.start)}>{ch.title}</button>
               <span>{formatTime(ch.start)}</span>
             </div>
           ))}
-        </div>
+        </details>
       ) : (
         <p className="progress">No chapters embedded in this file. Use bookmarks above to mark places instead — playback position is still saved.</p>
       )}
       {bookmarks.length > 0 && (
-        <div>
-          <h3>Bookmarks</h3>
+        <details open>
+          <summary><h3 style={{ display: 'inline' }}>Bookmarks</h3></summary>
           {bookmarks.map((b, i) => (
-            <div key={i}><button className="secondary" onClick={() => seekTo(b.time)}>{b.label}</button></div>
+            <div key={i}><button className="secondary" onClick={() => seekToGlobal(b.time)}>{b.label}</button></div>
           ))}
-        </div>
+        </details>
       )}
     </div>
   )
 }
+
 
 function ReadAlongView({ epubBook, audioBook, onBack, onSave }) {
   const [epubChapters, setEpubChapters] = useState([])

@@ -42,12 +42,25 @@ export function groupFilesByFolder(files) {
   return groups
 }
 
+// Directory of a picked file, for multi-part grouping: the full
+// relative directory ("Audiobooks/Scott Lynch/The Lies of Locke
+// Lamora") for a webkitdirectory pick, the SAF relative path's
+// directory for a lazy SAF file (its .dir), or '' for a flat pick.
+// The LAST segment is the book folder; the one before it is the
+// author folder (see src/lib/multipart.js).
+export function dirOfFile(file) {
+  if (!file) return ''
+  if (file.dir) return file.dir
+  const rel = file.webkitRelativePath
+  if (rel && rel.includes('/')) return rel.slice(0, rel.lastIndexOf('/'))
+  return ''
+}
+
 export function formatOfFileName(name) {
   if (/\.epub$/i.test(name)) return 'epub'
   if (/\.pdf$/i.test(name)) return 'pdf'
-  if (/\.cbz$/i.test(name)) return 'comic'
-  if (/\.cbr$/i.test(name)) return 'comic'
-  if (/\.m4b$/i.test(name) || /\.mp3$/i.test(name)) return 'audio'
+  if (/\.cbz$/i.test(name) || /\.cbr$/i.test(name) || /\.cbt$/i.test(name) || /\.cb7$/i.test(name)) return 'comic'
+  if (/\.m4b$/i.test(name) || /\.m4a$/i.test(name) || /\.mp4$/i.test(name) || /\.mp3$/i.test(name)) return 'audio'
   return null
 }
 
@@ -64,7 +77,7 @@ export function newFilesForRescan(files, existingBooks) {
 }
 
 export function isSupportedBookFile(file) {
-  return /\.(epub|pdf|cbz|cbr|m4b|mp3)$/i.test(file.name)
+  return /\.(epub|pdf|cbz|cbr|cbt|cb7|m4b|m4a|mp4|mp3)$/i.test(file.name)
 }
 
 // ---- Native SAF (Storage Access Framework) folders (v0.7.2) --------
@@ -75,35 +88,52 @@ export function isSupportedBookFile(file) {
 // resolves a path (null = the folder root) to entries shaped
 // { name, type } (type 'directory'/'file') or { name, isDir } — the
 // scoped-storage plugin returns `type`, so both are accepted.
-// Listing covers the folder root plus ONE level of subfolders.
-// Deeper nesting is intentionally not walked: book folders are
-// usually flat or one level deep, and a full recursive walk over a
-// huge tree would stall startup scans.
+// Listing covers the folder tree RECURSIVELY, to a max depth of 6
+// below the picked root, skipping hidden folders (names starting
+// with '.'). The old root + 1 level walk could not see the user's
+// real structure — root -> author folder -> book folder -> files —
+// so a watched audiobook root found nothing at all. Each result is
+// { name, path, dir }: path is the full relative path from the
+// picked root, dir is path minus the filename ('' for root files),
+// which is exactly the book-folder key multi-part grouping uses.
+// Author folders themselves are never returned as books — only
+// files are, and grouping happens on dir at import time.
+// A directory that fails to list (permission revoked mid-walk,
+// folder moved) is skipped, not fatal: the caller reports a
+// revoked/moved folder by name when the whole scan finds nothing
+// new, and other folders still scan.
 export async function listSafBookFiles(listDir) {
   const found = []
-  const root = await listDir(null)
-  for (const entry of root || []) {
-    const isDir = entry.type === 'directory' || entry.isDir === true
-    if (isDir) {
-      let sub = []
-      try { sub = await listDir(entry.name) } catch { sub = [] }
-      for (const f of sub || []) {
-        const subIsDir = f.type === 'directory' || f.isDir === true
-        if (!subIsDir && isSupportedBookFile(f)) found.push({ name: f.name, path: `${entry.name}/${f.name}` })
+  async function walk(relDir, depth) {
+    if (depth > 6) return
+    let entries = []
+    try { entries = await listDir(relDir || null) } catch { return }
+    for (const entry of entries || []) {
+      const name = entry.name
+      if (!name) continue
+      const isDir = entry.type === 'directory' || entry.isDir === true
+      const path = relDir ? `${relDir}/${name}` : name
+      if (isDir) {
+        if (name.startsWith('.')) continue
+        await walk(path, depth + 1)
+      } else if (isSupportedBookFile(entry)) {
+        found.push({ name, path, dir: relDir || '' })
       }
-    } else if (isSupportedBookFile(entry)) {
-      found.push({ name: entry.name, path: entry.name })
     }
   }
+  await walk('', 0)
   return found
 }
 
 // A file-like object importFiles() can consume: it only needs
 // `.name` and `.arrayBuffer()`. The bytes are fetched lazily, one
 // file at a time, so a whole folder is never held in memory at once.
-export function lazySafFile(name, readBytes) {
+// `dir` is the SAF relative directory (book folder) when known, so
+// multi-part grouping can use it exactly like webkitRelativePath.
+export function lazySafFile(name, readBytes, dir = '') {
   return {
     name,
+    dir,
     async arrayBuffer() { return readBytes() },
   }
 }

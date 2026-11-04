@@ -17,8 +17,14 @@
 // One extra guard, even for high-confidence matches: a cover found
 // by title/author search (not by ISBN) is treated as uncertain, even
 // when the other fields are high confidence. Work-level covers can
-// belong to a different edition, so the cover always goes to review
-// unless it came from an ISBN match to the same edition.
+// belong to a different edition, so the cover goes to review unless
+// it came from an ISBN match to the same edition — or unless the
+// user has turned ON the Settings toggle "Auto-apply covers on
+// exact title+author match" (default OFF), which moves exactly that
+// case (high confidence only, never fuzzy/first-result) into
+// auto-apply. The toggle is opt-in precisely because of the
+// different-edition risk, and every auto-applied cover is recorded
+// on the book so it can be corrected from the detail page.
 //
 // Series is deliberately NOT auto-proposed from these sources:
 // Open Library / Google Books series data is inconsistent, and a
@@ -70,23 +76,28 @@ async function fetchJson(url, timeoutMs = 12000) {
 }
 
 // Split a candidate's fields into auto-eligible and review-only parts.
-// `autoOk` means the whole match is high confidence. Even then, a
-// non-ISBN cover is review-only (see header comment).
-function splitCandidate(candidate, isbnMatch) {
+// Even for a high-confidence match, a non-ISBN cover is review-only
+// by default (see header comment). The ONE exception: when
+// `coverAutoApplyExact` is on (Settings toggle, default OFF), a
+// cover from a high-confidence match — ISBN, or an exact,
+// unambiguous title+author match — is auto-eligible like any other
+// high field. Fuzzy / first-result covers are NEVER auto-eligible,
+// toggle or not, because confidenceLevel is 'uncertain' for them.
+function splitCandidate(candidate, isbnMatch, coverAutoApplyExact = false) {
   if (!candidate) return null
   if (candidate.confidenceLevel !== 'high') {
-    return { ...candidate, autoProposals: {}, reviewProposals: { ...candidate.fields } }
+    return { ...candidate, isbnMatch, autoProposals: {}, reviewProposals: { ...candidate.fields } }
   }
   const autoProposals = {}
   const reviewProposals = {}
   for (const [field, value] of Object.entries(candidate.fields)) {
-    if (field === 'coverUrl' && !isbnMatch) reviewProposals[field] = value
+    if (field === 'coverUrl' && !isbnMatch && !coverAutoApplyExact) reviewProposals[field] = value
     else autoProposals[field] = value
   }
-  return { ...candidate, autoProposals, reviewProposals }
+  return { ...candidate, isbnMatch, autoProposals, reviewProposals }
 }
 
-async function fromOpenLibrary(book) {
+async function fromOpenLibrary(book, opts = {}) {
   const meta = book.metadata
   // 1. ISBN lookup — same edition by definition of the ISBN key.
   if (meta.isbn) {
@@ -108,7 +119,7 @@ async function fromOpenLibrary(book) {
           description: '',
           coverUrl: entry.cover ? entry.cover.large || entry.cover.medium || entry.cover.small : '',
         },
-      }, true)
+      }, true, opts.coverAutoApplyExact)
     }
   }
   // 2. Title + author search — high only on an exact, unambiguous match.
@@ -152,13 +163,13 @@ async function fromOpenLibrary(book) {
           description,
           coverUrl,
         },
-      }, false)
+      }, false, opts.coverAutoApplyExact)
     }
   }
   return null
 }
 
-async function fromGoogleBooks(book) {
+async function fromGoogleBooks(book, opts = {}) {
   const meta = book.metadata
   const parts = []
   const isbnQuery = !!meta.isbn
@@ -215,24 +226,30 @@ async function fromGoogleBooks(book) {
       description: cleanDescription(info.description),
       coverUrl: info.imageLinks ? info.imageLinks.large || info.imageLinks.thumbnail || '' : '',
     },
-  }, isbnMatch)
+  }, isbnMatch, opts.coverAutoApplyExact)
 }
 
 // Returns null when the book is already complete or no source matched,
 // otherwise { bookId, source, confidence, confidenceLevel,
-// confidenceReason, proposals, autoProposals, reviewProposals }.
-// `proposals` is the full set (kept for the review UI); the two
-// subsets partition it, so auto + review never overlap and nothing
-// is lost when only one side is applied.
-export async function enrichBook(book) {
+// confidenceReason, isbnMatch, proposals, autoProposals,
+// reviewProposals }. `proposals` is the full set (kept for the
+// review UI); the two subsets partition it, so auto + review never
+// overlap and nothing is lost when only one side is applied.
+// `opts.coverAutoApplyExact` (Settings toggle, default OFF) is the
+// only thing that can move a non-ISBN cover into autoProposals, and
+// only for a high-confidence (exact, unambiguous) match — see
+// splitCandidate. A book counts as having a cover when either
+// coverDataUrl or coverUrl is set (coverFor in App.jsx uses either),
+// so a stored cover URL alone already suppresses a new proposal.
+export async function enrichBook(book, opts = {}) {
   const meta = book.metadata
-  const candidate = (await fromOpenLibrary(book)) || (await fromGoogleBooks(book))
+  const candidate = (await fromOpenLibrary(book, opts)) || (await fromGoogleBooks(book, opts))
   if (!candidate) return null
   const proposals = {}
   for (const [field, value] of Object.entries(candidate.fields)) {
     if (!value) continue
     if (field === 'coverUrl') {
-      if (!meta.coverDataUrl) proposals.coverUrl = value
+      if (!meta.coverDataUrl && !meta.coverUrl) proposals.coverUrl = value
       continue
     }
     if (MISSING(meta[field])) proposals[field] = value
@@ -250,6 +267,7 @@ export async function enrichBook(book) {
     confidence: candidate.confidence,
     confidenceLevel: candidate.confidenceLevel,
     confidenceReason: candidate.confidenceReason,
+    isbnMatch: !!candidate.isbnMatch,
     proposals,
     autoProposals,
     reviewProposals,

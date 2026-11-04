@@ -138,7 +138,7 @@ export function parseAudio(arrayBuffer, fallbackName = 'Unknown audiobook') {
   const ilst = boxes.find((b) => b.type === 'ilst')
   if (ilst) { try { meta = parseIlst(dv, ilst) } catch { /* ignore */ } }
 
-  const title = meta['©nam'] || meta['nam'] || fallbackName.replace(/\.(m4b|mp3)$/i, '').replace(/[_-]+/g, ' ').trim()
+  const title = meta['©nam'] || meta['nam'] || fallbackName.replace(/\.(m4b|m4a|mp4|mp3)$/i, '').replace(/[_-]+/g, ' ').trim()
   const author = meta['©ART'] || meta['aART'] || ''
   const chapters = []
   for (const box of boxes.filter((b) => b.type === 'chpl')) {
@@ -155,6 +155,7 @@ export function parseAudio(arrayBuffer, fallbackName = 'Unknown audiobook') {
     title,
     titleFromFilename: !(meta['©nam'] || meta['nam']),
     author,
+    album: meta['©alb'] || meta['alb'] || '',
     creators: author ? [author] : [],
     language: '',
     publisher: '',
@@ -176,7 +177,7 @@ export function parseAudio(arrayBuffer, fallbackName = 'Unknown audiobook') {
 // Minimal ID3v2 text-frame reader for MP3s (TIT2/TPE1/TALB).
 export function parseMp3Tags(arrayBuffer, fallbackName = 'Unknown audiobook') {
   const bytes = new Uint8Array(arrayBuffer)
-  const out = { title: '', author: '' }
+  const out = { title: '', author: '', album: '' }
   if (!(bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33)) return out
   let pos = 10
   const end = Math.min(bytes.length, 10 + ((bytes[6] & 0x7f) << 21 | (bytes[7] & 0x7f) << 14 | (bytes[8] & 0x7f) << 7 | (bytes[9] & 0x7f)))
@@ -189,6 +190,7 @@ export function parseMp3Tags(arrayBuffer, fallbackName = 'Unknown audiobook') {
       const text = dec.decode(bytes.slice(pos + 11, pos + 10 + size)).replace(/\0/g, '').trim()
       if (id === 'TIT2') out.title = text
       if (id === 'TPE1') out.author = text
+      if (id === 'TALB') out.album = text
     }
     pos += 10 + size
   }

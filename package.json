@@ -11,6 +11,7 @@
     "@daniele-rolli/capacitor-scoped-storage": "0.1.0",
     "capacitor-plugin-playlist": "^8.0.0",
     "jszip": "^3.10.1",
+    "libarchive.js": "^2.0.2",
     "pdfjs-dist": "^4.2.67",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
@@ -28,5 +29,5 @@
     "preview": "vite preview"
   },
   "type": "module",
-  "version": "0.7.2"
+  "version": "0.7.3"
 }

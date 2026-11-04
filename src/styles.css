@@ -66,6 +66,33 @@ main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 96px; overflow-x: c
 .book-grid img, .book-grid .cover { width: 100%; aspect-ratio: 2/3; object-fit: cover; display: block; border-radius: 4px; background: var(--secondary-bg); color: var(--muted); font-size: 13px; text-align: center; }
 .book-grid-title { display: block; margin-top: 6px; font-size: 13px; line-height: 1.3; color: var(--ink); text-align: left; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .book-grid-author { display: block; margin-top: 2px; font-size: 12px; line-height: 1.3; color: var(--muted); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Shelf view: books standing upright on a plank, CSS only, no images.
+   Each row is books bottom-aligned (align-items: flex-end) over one
+   continuous board. The board is a muted wood gradient in both
+   themes (deliberately not bright in dark mode), with a shadow under
+   it so it reads as a plank, and each book carries its own shadow
+   where it meets the shelf plus a darker spine edge on the left.
+   Captions are a fixed height (title 2 lines + author 1 line) so
+   cover bottoms stay aligned to the board despite varied heights. */
+.shelf-wrap { display: flex; flex-direction: column; gap: 18px; max-width: 100%; min-width: 0; }
+.shelf-row { min-width: 0; }
+.shelf-books { display: flex; align-items: flex-end; gap: 8px; min-width: 0; }
+.shelf-book { flex: 1 1 0; min-width: 0; background: transparent; border: 0; border-radius: 4px; padding: 0; cursor: pointer; text-align: left; color: var(--ink); }
+.shelf-cover { position: relative; display: block; width: 100%; border-radius: 3px 2px 2px 3px; overflow: hidden; box-shadow: 0 3px 5px rgba(0, 0, 0, 0.45); }
+.shelf-cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.shelf-cover::after { content: ''; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 4px 0 6px rgba(0, 0, 0, 0.45), inset -1px 0 2px rgba(255, 255, 255, 0.14); pointer-events: none; }
+.shelf-cover::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: linear-gradient(to right, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)); pointer-events: none; z-index: 1; }
+.shelf-nocover { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; width: 100%; height: 100%; padding: 6px 4px; color: #f2ede6; text-align: center; overflow: hidden; }
+.shelf-nocover-title { font-size: 11px; font-weight: 600; line-height: 1.25; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 5; -webkit-box-orient: vertical; overflow-wrap: break-word; }
+.shelf-nocover-author { font-size: 9px; line-height: 1.25; opacity: 0.85; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: break-word; }
+.shelf-progress { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; background: rgba(0, 0, 0, 0.45); z-index: 2; }
+.shelf-progress span { display: block; height: 100%; background: var(--accent); }
+.shelf-captions { display: flex; gap: 8px; min-width: 0; }
+.shelf-caption-btn { flex: 1 1 0; min-width: 0; background: transparent; border: 0; border-radius: 4px; padding: 4px 0 0; cursor: pointer; text-align: left; color: var(--ink); height: 46px; overflow: hidden; }
+.shelf-title { display: block; font-size: 11px; line-height: 1.3; color: var(--ink); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: break-word; }
+.shelf-author { display: block; margin-top: 1px; font-size: 10px; line-height: 1.3; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shelf-board { height: 14px; margin-top: 0; border-radius: 2px; background: linear-gradient(to bottom, #7a5233 0%, #5d3d24 45%, #3f2918 100%); box-shadow: 0 7px 10px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.18); }
+[data-theme="light"] .shelf-board { background: linear-gradient(to bottom, #8a5a33 0%, #6b4426 45%, #4e3019 100%); box-shadow: 0 7px 10px rgba(60, 35, 10, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
 /* Series view: tag rows with count on the right, like reference shot 3. */
 .series-list { display: flex; flex-direction: column; gap: 8px; }
 .series-row { display: flex; align-items: center; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px; text-align: left; color: var(--ink); width: 100%; max-width: 100%; min-width: 0; }
@@ -179,6 +206,33 @@ main.reader-main { padding: 0; max-width: none; }
 .thumb.active { border-color: var(--accent); }
 .thumb img { width: 60px; height: 80px; object-fit: cover; display: block; border-radius: 4px; }
 .audio-controls input[type="range"] { width: 100%; }
+/* Webtoon mode: a continuous vertical strip, fit-width pages, no
+   gaps between pages (a strip, not a gallery). Scrolls inside the
+   viewer; the page nearest the top on scroll-stop is the resume
+   point (see ComicViewer). */
+.comic-webtoon { display: flex; flex-direction: column; gap: 0; max-height: 80vh; overflow-y: auto; overscroll-behavior-y: contain; }
+.comic-webtoon .comic-page { margin: 0 auto; border-radius: 0; }
+/* Dark audiobook player (Smart Audiobook Player style, HTML/CSS
+   only — no cast button, no codec badge, no lock-screen toggle,
+   no multi-file line, no loop button: none of those exist in this
+   app, and none are faked here). The wrapper forces dark colours
+   in every theme, because the reference player is dark. */
+.audio-player-dark { background: #141414; color: #f2f2f2; }
+.audio-player-dark h2, .audio-player-dark h3 { color: #f2f2f2; }
+.audio-player-dark .progress { color: #b8b8b8; }
+.audio-player-dark .error { background: #3d1a1a; border-color: #7a3333; color: #f2d0d0; }
+.audio-player-dark button { background: #2a2a2a; color: #f2f2f2; border-color: #444; }
+.audio-player-dark button:disabled { opacity: 0.4; }
+.audio-player-dark select { background: #2a2a2a; color: #f2f2f2; border-color: #444; }
+.audio-player-dark .chapter-row { border-bottom-color: #333; }
+.audio-player-main { display: flex; flex-direction: column; gap: 14px; }
+.audio-cover-wrap { position: relative; width: min(78vw, 340px); aspect-ratio: 1; margin: 4px auto 0; cursor: pointer; }
+.audio-cover { width: 100%; height: 100%; object-fit: cover; border-radius: 12px; display: block; }
+.audio-cover-placeholder { width: 100%; height: 100%; border-radius: 12px; background: #2a2a2a; display: flex; align-items: center; justify-content: center; font-size: 72px; }
+.audio-cover-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 84px; height: 84px; border-radius: 50%; font-size: 34px; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, 0.55); border: 2px solid rgba(255, 255, 255, 0.85); color: #fff; }
+.audio-seek input[type="range"] { width: 100%; accent-color: #e0a458; }
+.audio-times { display: flex; justify-content: space-between; font-size: 14px; color: #d8d8d8; margin-top: 4px; }
+.audio-skip-row { justify-content: center; }
 .chapter-row { display: flex; justify-content: space-between; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 .chapter-row.active { font-weight: 700; }
 @media (max-width: 600px) { .grid { grid-template-columns: repeat(3, 1fr); } }
