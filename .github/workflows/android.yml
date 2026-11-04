@@ -47,6 +47,16 @@ jobs:
           }
           EOF
 
+      - name: Decode app icon and splash
+        run: |
+          base64 -d assets/icon.png.b64 > assets/icon.png
+          base64 -d assets/splash.png.b64 > assets/splash.png
+
+      - name: Generate app icon and splash
+        run: |
+          npm install @capacitor/assets
+          npx @capacitor/assets generate --android
+
       - name: Build debug APK
         run: |
           cd android
