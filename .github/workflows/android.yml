@@ -42,6 +42,12 @@ jobs:
           printf '\next {\n    kotlin_version = "2.4.20"\n}\n' >> android/build.gradle
           sed -i 's/rootProject\.ext\.kotlin_version/kotlin_version/' node_modules/capacitor-plugin-playlist/android/build.gradle
 
+      - name: Bump AGP and compileSdk to 36
+        run: |
+          sed -i "s/com.android.tools.build:gradle:[0-9.]*/com.android.tools.build:gradle:8.9.1/" android/build.gradle
+          sed -i 's/compileSdkVersion *= *[0-9]*/compileSdkVersion = 36/' android/variables.gradle
+          if [ -n "$ANDROID_HOME" ]; then yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" || true; fi
+
       - name: Fix Kotlin duplicate classes
         run: |
           cat >> android/app/build.gradle <<'EOF'
