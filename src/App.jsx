@@ -357,6 +357,8 @@ export default function App() {
   const [proposals, setProposals] = useState([])
   const [enriching, setEnriching] = useState(false)
   const [enrichStatus, setEnrichStatus] = useState('')
+  const [dupStatus, setDupStatus] = useState('')
+  const [dupRunning, setDupRunning] = useState(false)
   // Muse catalog export / import (no backdoor: files the owner chooses to share/load).
   const [catalogPreview, setCatalogPreview] = useState(null)
   const [catalogStatus, setCatalogStatus] = useState('')
@@ -443,6 +445,30 @@ export default function App() {
   // Per-folder rescan for legacy (WebView) rows: the next 'rescan'
   // folder pick matches ONLY this name instead of every saved name.
   const legacyRescanTargetRef = useRef(null)
+  // NEVER SILENT (v0.7.6 scan feedback): rescanSafFolder previously
+  // set a status ONLY after importSafFolder returned. A scan that
+  // hangs — a plugin call that never settles (ScopedStorage
+  // readdir / getUriForPath / readFile have NO timeout anywhere,
+  // and listSafBookFiles only swallows errors that actually
+  // reject, never a call that never returns) — therefore showed
+  // nothing at all: no message, no import, app apparently idle.
+  // So every scan sets a "Scanning…" status FIRST, and a watchdog
+  // makes a long scan visible after 45 s. The watchdog does NOT
+  // cancel anything — the real completion status still overwrites
+  // it when the scan finally lands. A 0-found result is flagged as
+  // suspicious, not reported as a plain "no new books".
+  const scanWatchdogRef = useRef(null)
+  function startScanWatchdog(label) {
+    if (scanWatchdogRef.current) clearTimeout(scanWatchdogRef.current)
+    scanWatchdogRef.current = setTimeout(() => {
+      setWatchStatus(`Still scanning ${label} — this is taking longer than expected. Leave the app open; if it never finishes, the folder permission may be stuck — try Remove, then Add folder, for that folder.`)
+    }, 45000)
+    return () => { if (scanWatchdogRef.current) { clearTimeout(scanWatchdogRef.current); scanWatchdogRef.current = null } }
+  }
+  function safScanLine(w, found, imported) {
+    if (found === 0) return `"${w.name}": 0 files found — suspicious for a folder you know is full. It may be unreadable, moved, or its permission revoked; try Remove, then Add folder.`
+    return `"${w.name}": ${imported} new of ${found} found`
+  }
   const isNative = (() => { try { return Capacitor.isNativePlatform() } catch { return false } })()
   // Concise summary of the last Find Fixes run's auto-applied fixes.
   const [autoFixedSummary, setAutoFixedSummary] = useState([])
@@ -597,6 +623,18 @@ export default function App() {
   useEffect(() => { reload().catch(() => {}) }, [])
   useEffect(() => { if (folderRef.current) folderRef.current.setAttribute('webkitdirectory', '') }, [])
   useEffect(() => { if (watchFolderRef.current) watchFolderRef.current.setAttribute('webkitdirectory', '') }, [])
+  // Picker cancellation is otherwise completely silent: a cancelled
+  // file/folder pick fires no onChange, so no status is ever set
+  // and a tap looks like it did nothing. The 'cancel' event on the
+  // input is the only signal — wired with addEventListener because
+  // React does not reliably surface it as a prop on file inputs.
+  useEffect(() => {
+    const onCancel = () => setWatchStatus('Folder pick cancelled — nothing was imported or rescanned.')
+    const inputs = [folderRef.current, watchFolderRef.current].filter(Boolean)
+    for (const el of inputs) el.addEventListener('cancel', onCancel)
+    return () => { for (const el of inputs) el.removeEventListener('cancel', onCancel) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   // ---- Import ---------------------------------------------------------
   async function parseByFormat(file, buf) {
@@ -655,6 +693,42 @@ export default function App() {
     setImportErrors([])
     const errors = []
     let imported = 0
+    let skipped = 0
+    // IMPORT DEDUPE (v0.7.6): importFiles previously did NOT dedupe
+    // at all — only the SAF/WebView rescan paths did, via
+    // newFilesForRescan — so every file-pick re-import of the same
+    // folder added a full second (then third) copy of every book,
+    // and a crash + retry multiplied it. Now, before the loop, the
+    // existing library's fileNames are loaded (metadata only, never
+    // blobs) into a Set, and fileNames imported within THIS batch
+    // are tracked too. A candidate whose fileName is already in the
+    // library or already imported in this batch is skipped silently:
+    // not imported, not appended, not an error — just counted.
+    // DEDUPE KEY LIMIT (stated, not hidden): the key is fileName
+    // only (trimmed, case-insensitive), because the library stores
+    // no file size to compare against. Two DIFFERENT books that
+    // happen to share an exact fileName will be treated as the same
+    // book on import — the same rule the SAF rescan already uses,
+    // and far less harmful than silent triplication. Import is
+    // deliberately NOT deduped by title/author: that would wrongly
+    // skip legitimate different editions of the same book.
+    // Audio parts count too: a multi-part book's fileName is only
+    // its first part's name, so every part's fileName is added to
+    // the set, or a re-import of a multi-part book would slip
+    // through. Audio groups are checked as a GROUP below (a group
+    // whose files are ALL already present is skipped whole; a
+    // group with at least one new file imports normally — groups
+    // are never silently split).
+    const dedupeKey = (name) => String(name || '').trim().toLowerCase()
+    const existingFileNames = new Set()
+    {
+      const existing = await getAllBooksMeta()
+      for (const b of existing) {
+        if (b.fileName) existingFileNames.add(dedupeKey(b.fileName))
+        for (const p of b.audioParts || []) if (p.fileName) existingFileNames.add(dedupeKey(p.fileName))
+      }
+    }
+    const batchFileNames = new Set()
     // Batch throttling (v0.7.5 crash fix): appends, status, and
     // yields all happen on the same batch boundary — every 10
     // successfully imported books, plus a final flush at the end.
@@ -715,6 +789,9 @@ export default function App() {
           if (audioEntries.length % APPEND_BATCH_SIZE === 0) await yieldToEventLoop()
           continue
         }
+        // Dedupe (v0.7.6): already in the library, or already
+        // imported earlier in this same batch — skip silently.
+        if (existingFileNames.has(dedupeKey(file.name)) || batchFileNames.has(dedupeKey(file.name))) { skipped++; continue }
         const buf = await file.arrayBuffer()
         const parsed = await parseByFormat(file, buf)
         const metadata = { ...parsed.metadata }
@@ -732,6 +809,7 @@ export default function App() {
         }
         await putBookMeta(meta)
         await putBookFile(id, buf)
+        batchFileNames.add(dedupeKey(file.name))
         // Progressive import (v0.7.5), batched: queue this book —
         // it reaches the Library on the next batch flush (every 10
         // books / 500 ms / end of import), not via a render per book.
@@ -756,6 +834,12 @@ export default function App() {
     // "group these books" action is a future option, not built here).
     for (const group of groupAudioEntries(audioEntries)) {
       try {
+        // Dedupe (v0.7.6), GROUP level: skip whole only if EVERY
+        // part file is already in the library or already imported
+        // in this batch. A group with at least one new file imports
+        // normally — never silently split into a partial book.
+        const groupNames = group.entries.map((e) => dedupeKey(e.file.name))
+        if (groupNames.length && groupNames.every((n) => existingFileNames.has(n) || batchFileNames.has(n))) { skipped += group.entries.length; continue }
         const first = group.entries[0]
         const id = uid()
         const partsMeta = group.entries.map((e) => ({
@@ -844,6 +928,7 @@ export default function App() {
         if (isMulti) update.audioParts = audioParts
         if (audioParts[0] && audioParts[0].audioFileUri) update.audioFileUri = audioParts[0].audioFileUri
         await putBookMeta(update)
+        for (const e of group.entries) batchFileNames.add(dedupeKey(e.file.name))
         // Progressive import (v0.7.5), batched: queue the finished
         // GROUP (one book, with its parts/URIs/cover), never the
         // earlier bare meta above and never once per part file.
@@ -863,12 +948,91 @@ export default function App() {
     // the Done message and the reload() consistency pass below.
     appendBatch.flush()
     setImportErrors(errors)
-    setImportStatus(`Done — imported ${imported} book(s) from ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
+    setImportStatus(`Done — imported ${imported} book(s), ${skipped} already in library (skipped), from ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
     // Metadata only — never reload full file blobs after an import.
     // Consistency pass only (v0.7.5): books already appended one by
     // one above are re-read from IndexedDB; reload() replaces state
     // wholesale, so it cannot duplicate them.
     await reload()
+  }
+
+  // ---- Duplicate cleanup (v0.7.6) ------------------------------------
+  // Import dedupe stops NEW triplication, but it cannot fix a
+  // library that ALREADY has triples from repeated crash + retry
+  // imports on older builds. This Settings action cleans those up.
+  // Grouping key: fileName (trimmed, case-insensitive) when the
+  // book has one; for books with NO fileName, title + author
+  // (trimmed, case-insensitive) instead — and a book with neither
+  // fileName NOR title NOR author is never grouped with anything,
+  // so two such bare records can never delete each other. Within
+  // each group exactly ONE is kept — the earliest addedAt (ties:
+  // first by id) — and every other entry is deleted completely:
+  // multi-part audio blobs first (deleteBookFile per partId, plus
+  // deleteStoredAudio for natively stored parts — SAF in-place
+  // content:// URIs are skipped, they are the user's original
+  // files, not app copies), then deleteBook(id), which removes
+  // both the meta and the file blob. The kept copy is never
+  // written to, so its progress, bookmarks, series, and catalog
+  // data are untouched, and the only copy of a book can never be
+  // deleted (a group of one has nothing to delete).
+  async function removeDuplicateBooks() {
+    if (dupRunning) return
+    setDupRunning(true)
+    setDupStatus('Checking for duplicates…')
+    try {
+      const all = await getAllBooksMeta()
+      const groups = new Map()
+      for (const b of all) {
+        const fileName = String(b.fileName || '').trim()
+        let key
+        if (fileName) key = `fn:${fileName.toLowerCase()}`
+        else {
+          const title = String(b.metadata?.title || '').trim().toLowerCase()
+          const author = String(b.metadata?.author || '').trim().toLowerCase()
+          if (!title && !author) key = `unique:${b.id}`
+          else key = `ta:${title}|${author}`
+        }
+        if (!groups.has(key)) groups.set(key, [])
+        groups.get(key).push(b)
+      }
+      const duplicates = []
+      for (const list of groups.values()) {
+        if (list.length < 2) continue
+        const sorted = [...list].sort((a, b) => (a.addedAt || 0) - (b.addedAt || 0) || String(a.id).localeCompare(String(b.id)))
+        duplicates.push(...sorted.slice(1))
+      }
+      if (!duplicates.length) {
+        setDupStatus(`No duplicate books found — ${all.length} book(s) in the library.`)
+        return
+      }
+      if (!confirm(`Remove ${duplicates.length} duplicate book(s), keeping the earliest copy of each?`)) {
+        setDupStatus('Duplicate cleanup cancelled — nothing was removed.')
+        return
+      }
+      for (const dup of duplicates) {
+        for (const p of dup.audioParts || []) {
+          await deleteBookFile(p.partId)
+          if (p.audioFileUri && !String(p.audioFileUri).startsWith('content:')) {
+            try { await deleteStoredAudio(p.partId, p.fileName) } catch { /* already gone */ }
+          }
+        }
+        // Single-part native audio: the stored file lives on disk
+        // under the book id (not in IndexedDB), so deleteBook
+        // alone would orphan it. SAF in-place content:// URIs are
+        // skipped — those are the user's original files.
+        if (!dup.audioParts?.length && dup.audioFileUri && !String(dup.audioFileUri).startsWith('content:')) {
+          try { await deleteStoredAudio(dup.id, dup.fileName) } catch { /* already gone */ }
+        }
+        await deleteBook(dup.id)
+      }
+      const remaining = all.length - duplicates.length
+      await reload()
+      setDupStatus(`Removed ${duplicates.length} duplicate book(s) — ${remaining} book(s) remain.`)
+    } catch (e) {
+      setDupStatus(`Duplicate cleanup failed: ${e && e.message ? e.message : e}`)
+    } finally {
+      setDupRunning(false)
+    }
   }
 
   // ---- Watched folders ------------------------------------------------
@@ -878,7 +1042,9 @@ export default function App() {
   // save); 'add' = Settings "Add folder" (save + import);
   // 'rescan' = startup/Settings rescan (import only files whose
   // folder name matches a saved watched folder, and only files not
-  // already in the library — importFiles itself does NOT dedupe).
+  // already in the library — rescan pre-filters via
+  // newFilesForRescan, and importFiles itself now dedupes too
+  // (v0.7.6), so a double pass can never duplicate a book).
   async function handleFolderPick(fileList, mode) {
     // Folder covers come from the UNFILTERED pick (v0.7.4): the
     // book-file filter below would drop EmbeddedCover.jpg etc.
@@ -923,13 +1089,14 @@ export default function App() {
       }
       // Record what this scan found, even when nothing was new.
       setWatchedFolders((prev) => prev.map((w) => (found[w.name] !== undefined ? { ...w, lastCount: found[w.name], lastScannedAt: Date.now() } : w)))
+      const totalFound = Object.values(found).reduce((a, b) => a + b, 0)
       if (!toImport.length) {
-        setWatchStatus(`Rescan done — no new books in ${Object.keys(found).join(', ')}. Everything picked is already in the library.`)
+        setWatchStatus(`Rescan done — ${totalFound} file(s) found in ${Object.keys(found).join(', ')}, no new books. Everything picked is already in the library.`)
         await reload()
         return
       }
       await importFiles(toImport, folderCovers)
-      setWatchStatus(`Rescan done — imported ${toImport.length} new book(s) from ${Object.keys(found).join(', ')}.`)
+      setWatchStatus(`Rescan done — imported ${toImport.length} new book(s) from ${Object.keys(found).join(', ')} (${totalFound} file(s) found).`)
       return
     }
     // 'library' and 'add': import everything picked.
@@ -1179,38 +1346,58 @@ export default function App() {
       const rest = prev.filter((x) => !(x.saf && x.id === folder.id))
       return [...rest, { ...w, lastCount: undefined, lastScannedAt: Date.now() }]
     })
+    setWatchStatus(`Folder "${name}" saved — scanning it now…`)
+    const stopWatchdog = startScanWatchdog(`"${name}"`)
     try {
       const { found, imported } = await importSafFolder(w)
+      stopWatchdog()
       setWatchStatus(`Folder "${name}" saved — ${found} book file(s) found, ${imported} new imported. It will be rescanned automatically on startup; no re-pick needed.`)
     } catch (e) {
+      stopWatchdog()
       // The folder was picked and saved, but listing/reading failed
       // (permission revoked between pick and scan, folder moved, …).
       setWatchStatus(`Folder "${name}" was saved, but it could not be read right now (${e && e.message ? e.message : e}). Re-pick it from Settings if it was moved, or tap its Rescan button to try again.`)
     }
   }
   async function rescanSafFolder(w) {
+    // Status FIRST, so a tap always produces visible feedback even
+    // if the scan hangs before returning (see startScanWatchdog).
+    setWatchStatus(`Scanning "${w.name}"…`)
+    const stopWatchdog = startScanWatchdog(`"${w.name}"`)
     try {
       const { found, imported } = await importSafFolder(w)
-      setWatchStatus(imported
-        ? `Rescan of "${w.name}" done — imported ${imported} new book(s) (${found} found).`
-        : `Rescan of "${w.name}" done — no new books (${found} found, everything already in the library).`)
+      stopWatchdog()
+      setWatchStatus(found === 0
+        ? `Rescan of "${w.name}" done — 0 files found, which is suspicious for a folder you know is full. It may be unreadable, moved, or its permission revoked; try Remove, then Add folder.`
+        : imported
+          ? `Rescan of "${w.name}" done — imported ${imported} new book(s) (${found} found).`
+          : `Rescan of "${w.name}" done — no new books (${found} found, everything already in the library).`)
     } catch (e) {
+      stopWatchdog()
       setWatchStatus(`"${w.name}" could not be opened — its permission may have been revoked, or the folder was moved or deleted. Re-pick just that folder from Settings (Remove, then Add folder) to restore it. (${e && e.message ? e.message : e})`)
     }
   }
   async function rescanAllSafFolders() {
     const saf = watchedFolders.filter((w) => w.saf && w.id)
+    const legacy = watchedFolders.filter((w) => !(w.saf && w.id))
     if (!saf.length) { setWatchStatus('No saved-folder-access folders to rescan. Older folders still need the folder picker — use their per-folder Rescan button.'); return }
+    setWatchStatus(`Scanning ${saf.length} saved-access folder(s)…`)
+    const stopWatchdog = startScanWatchdog('your watched folders')
     const lines = []
     for (const w of saf) {
       try {
         const { found, imported } = await importSafFolder(w)
-        lines.push(`"${w.name}": ${imported} new of ${found} found`)
+        lines.push(safScanLine(w, found, imported))
       } catch (e) {
         lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
       }
     }
-    setWatchStatus(`Startup rescan done — ${lines.join('; ')}`)
+    stopWatchdog()
+    // Previously, legacy rows were silently skipped here whenever
+    // at least one SAF folder existed — a folder listed in Settings
+    // that this button never touched, with no word about it.
+    const legacyNote = legacy.length ? ` Older folder(s) not scanned by this button — they need re-picking via their per-folder Rescan button: ${legacy.map((w) => w.name).join(', ')}.` : ''
+    setWatchStatus(`Rescan done — ${lines.join('; ')}.${legacyNote}`)
   }
   // TRUE startup scan (SAF folders only): runs once per app start
   // when the toggle is ON, with no tap and no re-pick. Legacy
@@ -1224,16 +1411,19 @@ export default function App() {
     if (!scanOnStartup || !isNative) return
     const saf = watchedFolders.filter((w) => w.saf && w.id)
     if (!saf.length) return
+    setWatchStatus(`Scanning ${saf.length} watched folder(s) on startup…`)
+    const stopWatchdog = startScanWatchdog('your watched folders on startup')
     ;(async () => {
       const lines = []
       for (const w of saf) {
         try {
           const { found, imported } = await importSafFolder(w)
-          lines.push(`"${w.name}": ${imported} new of ${found} found`)
+          lines.push(safScanLine(w, found, imported))
         } catch {
           lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
         }
       }
+      stopWatchdog()
       setWatchStatus(`Startup rescan done — ${lines.join('; ')}`)
     })()
     // Only the mount run: watchedFolders/scanOnStartup are read
@@ -2265,9 +2455,9 @@ export default function App() {
             {scanOnStartup && watchedFolders.length > 0 && !watchPromptDismissed && (
               <div className="card">
                 <p><strong>Watched folders saved:</strong> {watchedFolders.map((w) => w.name).join(', ')}.</p>
-                <p className="progress">Folders with saved folder access are rescanned automatically on startup. Older folders (no saved access) still need re-picking: tap Rescan and pick the folder again to import any new books.</p>
+                <p className="progress">Folders with saved folder access are rescanned automatically on startup, and the Rescan button below scans them directly — no re-pick. Older folders (no saved access) still need re-picking: use their per-folder Rescan button in Settings and pick the folder again to import any new books.</p>
                 <div className="toolbar">
-                  <button onClick={() => { folderPickModeRef.current = 'rescan'; folderRef.current.click() }}>Rescan watched folders</button>
+                  <button onClick={() => { if (isNative) rescanAllSafFolders(); else { setWatchStatus('Pick a watched folder again to rescan it…'); folderPickModeRef.current = 'rescan'; folderRef.current.click() } }}>Rescan watched folders</button>
                   <button className="secondary" onClick={() => setWatchPromptDismissed(true)}>Dismiss</button>
                 </div>
                 {watchStatus && <p className="progress">{watchStatus}</p>}
@@ -2290,6 +2480,11 @@ export default function App() {
               <input ref={folderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.cbt,.cb7,.m4b,.m4a,.mp4,.mp3" multiple hidden webkitdirectory=""
                 onChange={(e) => { const mode = folderPickModeRef.current; folderPickModeRef.current = 'library'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
               <p className="progress">{importStatus}</p>
+              {/* Scan status is visible here too, not only inside
+                  the watched-folders prompt card above: that card
+                  disappears once dismissed, which previously made
+                  a Library-side scan's status invisible entirely. */}
+              {watchStatus && <p className="progress">{watchStatus}</p>}
               {importErrors.length > 0 && (
                 <div className="error">
                   {importErrors.map((err, i) => <div key={i}>{err}</div>)}
@@ -2457,7 +2652,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.5</p>
+              <p className="progress">ShelfSort v0.7.6</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
@@ -2468,7 +2663,7 @@ export default function App() {
               </label>
               <div className="toolbar">
                 <button onClick={() => { if (isNative) addSafFolder(); else watchFolderRef.current.click() }}>Add folder</button>
-                <button className="secondary" disabled={!watchedFolders.length} onClick={() => { if (isNative) rescanAllSafFolders(); else { watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() } }}>Rescan watched folders</button>
+                <button className="secondary" disabled={!watchedFolders.length} onClick={() => { if (isNative) rescanAllSafFolders(); else { setWatchStatus('Pick a watched folder again to rescan it…'); watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() } }}>Rescan watched folders</button>
               </div>
               <input ref={watchFolderRef} type="file" accept=".epub,.pdf,.cbz,.cbr,.cbt,.cb7,.m4b,.m4a,.mp4,.mp3" multiple hidden webkitdirectory=""
                 onChange={(e) => { const mode = watchPickModeRef.current; watchPickModeRef.current = 'add'; handleFolderPick(e.target.files, mode); e.target.value = '' }} />
@@ -2481,7 +2676,7 @@ export default function App() {
                     <span className="toolbar">
                       <button className="secondary" onClick={() => {
                         if (w.saf && w.id) rescanSafFolder(w)
-                        else { legacyRescanTargetRef.current = w.name; watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() }
+                        else { setWatchStatus(`Pick "${w.name}" again to rescan it — Android does not let the app reopen it on its own.`); legacyRescanTargetRef.current = w.name; watchPickModeRef.current = 'rescan'; watchFolderRef.current.click() }
                       }}>Rescan</button>
                       <button className="secondary" onClick={() => setWatchedFolders((prev) => prev.filter((x) => w.saf ? !(x.saf && x.id === w.id) : x.name !== w.name))}>Remove</button>
                     </span>
@@ -2512,8 +2707,13 @@ export default function App() {
                 <button className="secondary" onClick={() => runEnrichment('covers')} disabled={enriching || !books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length}>
                   {enriching ? 'Checking…' : `Find missing covers (${books.filter((b) => !(b.metadata.coverDataUrl || b.metadata.coverUrl)).length})`}
                 </button>
+                <button className="secondary" onClick={removeDuplicateBooks} disabled={dupRunning || !books.length}>
+                  {dupRunning ? 'Removing…' : 'Remove duplicate books'}
+                </button>
               </div>
               {enrichStatus && <p className="progress">{enrichStatus}</p>}
+              {dupStatus && <p className="progress">{dupStatus}</p>}
+              <p className="progress">“Remove duplicate books” fixes libraries that were tripled by repeated imports on older builds: it groups books by file name (or by title + author when a book has no file name), keeps the earliest copy of each, and deletes the other copies completely — including their file data. It never deletes the only copy of a book, and it never changes the kept copy's progress, series, or other data.</p>
               <p className="progress">High confidence means an ISBN match to the same edition, or an exact title + author match with a single result. Everything uncertain goes to Fix Review. “Find missing covers” only scans books with no cover, only proposes covers (never other fields, never overwriting a cover), and shows them as thumbnails in Fix Review — apply per book, or all at once.</p>
             </div>
             <div className="card">

@@ -65,9 +65,10 @@ export function formatOfFileName(name) {
 }
 
 // Files from a rescan that are NOT already in the library, matched
-// by fileName + format. NOTE: importFiles itself does NOT dedupe —
-// every import creates a new book — so rescan does its own dedupe
-// here instead of relying on importFiles.
+// by fileName + format. Rescan pre-filters here AND importFiles now
+// dedupes itself (v0.7.6, by fileName) — the pre-filter keeps rescan
+// counts accurate, and the import-level dedupe is the backstop that
+// stops a plain file-pick re-import from triplicating a library.
 export function newFilesForRescan(files, existingBooks) {
   const seen = new Set((existingBooks || []).map((b) => `${b.fileName}::${b.format}`))
   return files.filter((f) => {
