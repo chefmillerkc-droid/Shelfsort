@@ -115,13 +115,24 @@ export function folderCoverRank(name) {
 // new, and other folders still scan.
 export async function listSafBookFiles(listDir) {
   const found = []
+  // v0.7.7: subfolders whose listing rejects used to vanish silently
+  // (catch-return above) — a whole author/book subtree could drop
+  // out of `found` with no word about it, so a folder with hundreds
+  // of books could legitimately report a small found count. Pruned
+  // directories are now reported by name so the status line can say
+  // which subtree was unreadable instead of pretending it is empty.
+  const pruned = []
+  let processed = 0
   async function walk(relDir, depth) {
     if (depth > 6) return
     let entries = []
-    try { entries = await listDir(relDir || null) } catch { return }
+    try { entries = await listDir(relDir || null) } catch { pruned.push(relDir || '(root)'); return }
     for (const entry of entries || []) {
       const name = entry.name
       if (!name) continue
+      // Yield periodically during a hundreds-of-folders walk so the
+      // WebView event loop is never starved by one long scan.
+      if (++processed % 50 === 0) await new Promise((r) => setTimeout(r, 0))
       const isDir = entry.type === 'directory' || entry.isDir === true
       const path = relDir ? `${relDir}/${name}` : name
       if (isDir) {
@@ -137,7 +148,7 @@ export async function listSafBookFiles(listDir) {
     }
   }
   await walk('', 0)
-  return found
+  return { found, pruned }
 }
 
 // A file-like object importFiles() can consume: it only needs

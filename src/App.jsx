@@ -458,16 +458,34 @@ export default function App() {
   // it when the scan finally lands. A 0-found result is flagged as
   // suspicious, not reported as a plain "no new books".
   const scanWatchdogRef = useRef(null)
+  // v0.7.7 watchdog fix: this used to be a ONE-SHOT 45 s timer, so
+  // any status set after it fired (e.g. importSafFolder's audio
+  // note) overwrote "Still scanning…" permanently, and on the
+  // startup path a screenshot taken after that overwrite looked
+  // like the watchdog never fired at all. It is now a REPEATING
+  // interval: every 45 s it re-asserts "Still scanning…", so no
+  // intermediate status can hide a stalled scan for good. The
+  // startup path uses this exact same helper — code-read found no
+  // startup-specific clearing of the timer — so a missing "Still
+  // scanning…" on startup means either the screenshot was taken
+  // before 45 s, or the main thread was blocked by synchronous
+  // parse work (see the per-part yields in importSafAudio) long
+  // enough to delay timers, not that the watchdog was skipped.
   function startScanWatchdog(label) {
-    if (scanWatchdogRef.current) clearTimeout(scanWatchdogRef.current)
-    scanWatchdogRef.current = setTimeout(() => {
+    if (scanWatchdogRef.current) clearInterval(scanWatchdogRef.current)
+    scanWatchdogRef.current = setInterval(() => {
       setWatchStatus(`Still scanning ${label} — this is taking longer than expected. Leave the app open; if it never finishes, the folder permission may be stuck — try Remove, then Add folder, for that folder.`)
     }, 45000)
-    return () => { if (scanWatchdogRef.current) { clearTimeout(scanWatchdogRef.current); scanWatchdogRef.current = null } }
+    return () => { if (scanWatchdogRef.current) { clearInterval(scanWatchdogRef.current); scanWatchdogRef.current = null } }
   }
-  function safScanLine(w, found, imported) {
+  // v0.7.7: a scan line must always carry all three numbers —
+  // found, new, and already-in-library — plus any pruned subfolders,
+  // so "19 new" can never be misread as "only 19 scanned".
+  function safScanLine(w, found, imported, already = 0, pruned = []) {
     if (found === 0) return `"${w.name}": 0 files found — suspicious for a folder you know is full. It may be unreadable, moved, or its permission revoked; try Remove, then Add folder.`
-    return `"${w.name}": ${imported} new of ${found} found`
+    const alreadyNote = already ? `, ${already} already in library` : ''
+    const prunedNote = pruned && pruned.length ? `; WARNING: ${pruned.length} subfolder(s) could not be listed and were skipped: ${pruned.slice(0, 5).join(', ')}${pruned.length > 5 ? '…' : ''}` : ''
+    return `"${w.name}": ${imported} new of ${found} found${alreadyNote}${prunedNote}`
   }
   const isNative = (() => { try { return Capacitor.isNativePlatform() } catch { return false } })()
   // Concise summary of the last Find Fixes run's auto-applied fixes.
@@ -688,7 +706,7 @@ export default function App() {
 
   async function importFiles(fileList, folderCovers) {
     const files = [...fileList].filter((f) => /\.(epub|pdf|cbz|cbr|cbt|cb7|m4b|m4a|mp4|mp3)$/i.test(f.name))
-    if (!files.length) { setImportStatus('No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'); return }
+    if (!files.length) { setImportStatus('No supported files found (.epub, .pdf, .cbz, .cbr, .cbt, .cb7, .m4b, .m4a, .mp4, .mp3).'); return { imported: 0, skipped: 0 } }
     setImportStatus(`Importing ${files.length} file(s)…`)
     setImportErrors([])
     const errors = []
@@ -954,6 +972,9 @@ export default function App() {
     // one above are re-read from IndexedDB; reload() replaces state
     // wholesale, so it cannot duplicate them.
     await reload()
+    // v0.7.7: return ACTUAL successes, so SAF callers can report
+    // real imported counts instead of "attempted" counts.
+    return { imported, skipped }
   }
 
   // ---- Duplicate cleanup (v0.7.6) ------------------------------------
@@ -1131,8 +1152,11 @@ export default function App() {
     return res.entries || []
   }
   async function scanSafFolder(w) {
-    const found = await listSafBookFiles((path) => safListEntries(w, path))
-    return found
+    // v0.7.7: returns { files, pruned } — pruned subfolders (whose
+    // listing rejected) are reported by name instead of silently
+    // vanishing from the found count.
+    const { found, pruned } = await listSafBookFiles((path) => safListEntries(w, path))
+    return { files: found, pruned }
   }
   // SAF audio, imported IN PLACE (v0.7.4 — the large-audiobook
   // fix). The old path read every SAF file whole through
@@ -1181,6 +1205,8 @@ export default function App() {
     }
     let imported = 0
     let skippedPartial = 0
+    let skippedWhole = 0
+    let skippedWholeFiles = 0
     const errors = []
     // Batch throttling, same as importFiles (v0.7.5 crash fix):
     // appends flush every 10 books, with a yield on that boundary,
@@ -1191,11 +1217,17 @@ export default function App() {
     // share a part filename (e.g. part1.m4b in both), and the second
     // one must not be blocked by the first one imported in this
     // same scan. So knownFileNames is read-only here.
+    // v0.7.7: yield every 10 GROUPS processed, not just every 10
+    // imports — skipped/failed groups never counted toward
+    // `imported`, so a folder of hundreds of already-present or
+    // failing groups previously ran with no yield at all.
+    let groupsProcessed = 0
     for (const [dir, list] of byDir) {
       list.sort((a, b) => naturalCompare(a.name, b.name))
       const present = list.filter((f) => knownFileNames.has(f.name)).length
-      if (present === list.length) continue
-      if (present > 0) { skippedPartial++; continue }
+      if (present === list.length) { skippedWhole++; skippedWholeFiles += list.length; if (++groupsProcessed % 10 === 0) await yieldToEventLoop(); continue }
+      if (present > 0) { skippedPartial++; if (++groupsProcessed % 10 === 0) await yieldToEventLoop(); continue }
+      groupsProcessed++
       const isMulti = list.length > 1
       const title = dir
         ? cleanFolderName(lastSegmentOfDir(dir))
@@ -1207,6 +1239,12 @@ export default function App() {
         const parts = []
         for (let i = 0; i < list.length; i++) {
           const f = list[i]
+          // v0.7.7: yield INSIDE a group, every 10 parts. A group
+          // is one book folder — but files dumped loose at a folder
+          // root all share dir '', so they form ONE giant group, and
+          // a multi-hundred-part group previously ran with no yield
+          // at all until the whole group finished (or died trying).
+          if (i > 0 && i % 10 === 0) await yieldToEventLoop()
           const res = await ScopedStorage.getUriForPath({ folder: safFolderRef(w), path: f.path })
           if (!res || !res.uri) throw new Error(`"${f.name}" has no playable URI in its folder`)
           let durationSec = null
@@ -1269,19 +1307,31 @@ export default function App() {
       } catch (e) {
         errors.push(`${list.map((f) => f.name).join(', ')}: ${e.message}`)
       }
+      // Yield on the group boundary too, so failed groups also breathe.
+      if (groupsProcessed % 10 === 0) await yieldToEventLoop()
     }
     // Final flush: any SAF audio books still buffered (including
     // every book of a small scan) appear before the caller reports.
     appendBatch.flush()
-    return { imported, skippedPartial, errors }
+    return { imported, skippedPartial, skippedWhole, skippedWholeFiles, errors }
   }
 
   // Import one SAF folder's books, deduped against the library by
   // fileName+format (the same rule as WebView rescan) for non-audio,
   // and by whole book folder for audio (see importSafAudio). Returns
-  // { found, imported } and updates ONLY this folder's row.
-  async function importSafFolder(w) {
-    const found = await scanSafFolder(w)
+  // { found, imported, already, pruned } and updates ONLY this
+  // folder's row. v0.7.7: `imported` is ACTUAL successes (from
+  // importFiles' return), never "attempted"; `already` counts files
+  // that were found but already in the library, so a status line
+  // can never again read as "only scanned N" when it really means
+  // "N new of hundreds found, the rest already in the library".
+  // runToken (v0.7.7, optional): { stalled: false } — set by a
+  // multi-folder loop when it gives up waiting on this folder, so
+  // the folder's late internal status notes cannot overwrite the
+  // loop's later, correct status. Its return value is discarded in
+  // that case; its per-book commits still land if it finishes.
+  async function importSafFolder(w, runToken) {
+    const { files: found, pruned } = await scanSafFolder(w)
     const existing = await getAllBooksMeta()
     const audioFound = found.filter((f) => /\.(m4b|m4a|mp4|mp3)$/i.test(f.name))
     const otherFound = found.filter((f) => !/\.(m4b|m4a|mp4|mp3)$/i.test(f.name))
@@ -1313,20 +1363,24 @@ export default function App() {
       if (b.fileName) knownFileNames.add(b.fileName)
       for (const p of b.audioParts || []) if (p.fileName) knownFileNames.add(p.fileName)
     }
-    const audioRes = audioFound.length ? await importSafAudio(w, audioFound, knownFileNames) : { imported: 0, skippedPartial: 0, errors: [] }
-    if (lazyFiles.length) await importFiles(lazyFiles)
-    else await reload()
+    const audioRes = audioFound.length ? await importSafAudio(w, audioFound, knownFileNames) : { imported: 0, skippedPartial: 0, skippedWholeFiles: 0, errors: [] }
+    // Non-audio through the normal path — but note its status line
+    // is overwritten below by the per-folder SAF status, which is
+    // the one that carries found/new/already/pruned.
+    const nonAudioRes = lazyFiles.length ? await importFiles(lazyFiles) : null
+    if (!lazyFiles.length) await reload()
+    const already = (otherFound.length - toImport.length) + (audioRes.skippedWholeFiles || 0)
     const audioNote = [
       audioRes.imported ? `${audioRes.imported} audiobook(s) linked in place` : '',
       audioRes.skippedPartial ? `${audioRes.skippedPartial} audiobook folder(s) skipped (partly imported already — remove the old entries first, then rescan)` : '',
       audioRes.errors.length ? `audio errors: ${audioRes.errors.join('; ')}` : '',
     ].filter(Boolean).join(' — ')
-    if (audioNote) setWatchStatus(audioNote)
+    if (audioNote && !(runToken && runToken.stalled)) setWatchStatus(audioNote)
     setWatchedFolders((prev) => prev.map((x) => (
       x.saf && x.id === w.id
         ? { ...x, lastCount: found.length, lastScannedAt: Date.now() } : x
     )))
-    return { found: found.length, imported: lazyFiles.length + audioRes.imported }
+    return { found: found.length, imported: (nonAudioRes ? nonAudioRes.imported : 0) + audioRes.imported, already, pruned }
   }
   async function addSafFolder() {
     let picked
@@ -1349,9 +1403,9 @@ export default function App() {
     setWatchStatus(`Folder "${name}" saved — scanning it now…`)
     const stopWatchdog = startScanWatchdog(`"${name}"`)
     try {
-      const { found, imported } = await importSafFolder(w)
+      const { found, imported, already, pruned } = await importSafFolder(w)
       stopWatchdog()
-      setWatchStatus(`Folder "${name}" saved — ${found} book file(s) found, ${imported} new imported. It will be rescanned automatically on startup; no re-pick needed.`)
+      setWatchStatus(`Folder "${name}" saved — ${found} book file(s) found, ${imported} new imported${already ? `, ${already} already in library` : ''}${pruned.length ? `; WARNING: ${pruned.length} subfolder(s) could not be listed: ${pruned.slice(0, 5).join(', ')}` : ''}. It will be rescanned automatically on startup; no re-pick needed.`)
     } catch (e) {
       stopWatchdog()
       // The folder was picked and saved, but listing/reading failed
@@ -1365,13 +1419,13 @@ export default function App() {
     setWatchStatus(`Scanning "${w.name}"…`)
     const stopWatchdog = startScanWatchdog(`"${w.name}"`)
     try {
-      const { found, imported } = await importSafFolder(w)
+      const { found, imported, already, pruned } = await importSafFolder(w)
       stopWatchdog()
       setWatchStatus(found === 0
         ? `Rescan of "${w.name}" done — 0 files found, which is suspicious for a folder you know is full. It may be unreadable, moved, or its permission revoked; try Remove, then Add folder.`
         : imported
-          ? `Rescan of "${w.name}" done — imported ${imported} new book(s) (${found} found).`
-          : `Rescan of "${w.name}" done — no new books (${found} found, everything already in the library).`)
+          ? `Rescan of "${w.name}" done — imported ${imported} new book(s) (${found} found${already ? `, ${already} already in library` : ''})${pruned.length ? `; WARNING: ${pruned.length} subfolder(s) could not be listed: ${pruned.slice(0, 5).join(', ')}` : ''}.`
+          : `Rescan of "${w.name}" done — no new books (${found} found${already ? `, ${already} already in library` : ''}, everything already in the library)${pruned.length ? `; WARNING: ${pruned.length} subfolder(s) could not be listed: ${pruned.slice(0, 5).join(', ')}` : ''}.`)
     } catch (e) {
       stopWatchdog()
       setWatchStatus(`"${w.name}" could not be opened — its permission may have been revoked, or the folder was moved or deleted. Re-pick just that folder from Settings (Remove, then Add folder) to restore it. (${e && e.message ? e.message : e})`)
@@ -1384,12 +1438,46 @@ export default function App() {
     setWatchStatus(`Scanning ${saf.length} saved-access folder(s)…`)
     const stopWatchdog = startScanWatchdog('your watched folders')
     const lines = []
-    for (const w of saf) {
+    for (let fi = 0; fi < saf.length; fi++) {
+      const w = saf[fi]
+      // v0.7.7: per-folder START status, so the user can see which
+      // folder the scan is currently on — a stall in Audiobooks
+      // reads as "Now scanning Audiobooks…", not as silence.
+      setWatchStatus(`Now scanning "${w.name}" (${fi + 1} of ${saf.length})…`)
+      // Per-folder stall timeout (5 min): a never-settling plugin
+      // call in one folder must not hold every later folder
+      // hostage forever. On timeout the loop records the stall and
+      // moves on; the stalled scan keeps running in the background
+      // and its per-book commits still land if it ever finishes —
+      // only its status notes are suppressed (see runToken).
+      const token = { stalled: false }
+      let timer = null
+      const timeoutP = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), 300000) })
+      let outcome
       try {
-        const { found, imported } = await importSafFolder(w)
-        lines.push(safScanLine(w, found, imported))
+        outcome = await Promise.race([
+          importSafFolder(w, token).then((v) => ({ ok: true, v })),
+          timeoutP.then(() => ({ ok: false })),
+        ])
       } catch (e) {
+        outcome = { ok: true, error: e }
+      } finally { if (timer) clearTimeout(timer) }
+      if (outcome && outcome.ok && !outcome.error) {
+        const { found, imported, already, pruned } = outcome.v
+        lines.push(safScanLine(w, found, imported, already, pruned))
+        // Flush progress after EACH folder, not only at the end.
+        // The old code buffered every folder's line and only
+        // displayed them when the whole chain finished — so a crash
+        // during the Audiobooks scan erased the books scan's result
+        // too, and the user only ever saw the crash, never the 19.
+        setWatchStatus(`Rescan so far — ${lines.join('; ')}; still scanning…`)
+      } else if (outcome && outcome.error) {
         lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
+        setWatchStatus(`Rescan so far — ${lines.join('; ')}; still scanning…`)
+      } else {
+        token.stalled = true
+        lines.push(`"${w.name}": stalled after 5 minutes — skipped for now so the other folders could scan. Its books may still appear if the background scan finishes; otherwise tap its Rescan button to retry, or Remove then Add folder to re-grant permission.`)
+        setWatchStatus(`Rescan so far — ${lines.join('; ')}; still scanning…`)
       }
     }
     stopWatchdog()
@@ -1415,12 +1503,36 @@ export default function App() {
     const stopWatchdog = startScanWatchdog('your watched folders on startup')
     ;(async () => {
       const lines = []
-      for (const w of saf) {
+      for (let fi = 0; fi < saf.length; fi++) {
+        const w = saf[fi]
+        // v0.7.7: per-folder START status + 5-minute stall timeout,
+        // same as rescanAll — a stalled Audiobooks scan must neither
+        // erase the books result nor block the chain forever. See
+        // rescanAll for the full explanation.
+        setWatchStatus(`Now scanning "${w.name}" (${fi + 1} of ${saf.length}) on startup…`)
+        const token = { stalled: false }
+        let timer = null
+        const timeoutP = new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), 300000) })
+        let outcome
         try {
-          const { found, imported } = await importSafFolder(w)
-          lines.push(safScanLine(w, found, imported))
-        } catch {
+          outcome = await Promise.race([
+            importSafFolder(w, token).then((v) => ({ ok: true, v })),
+            timeoutP.then(() => ({ ok: false })),
+          ])
+        } catch (e) {
+          outcome = { ok: true, error: e }
+        } finally { if (timer) clearTimeout(timer) }
+        if (outcome && outcome.ok && !outcome.error) {
+          const { found, imported, already, pruned } = outcome.v
+          lines.push(safScanLine(w, found, imported, already, pruned))
+          setWatchStatus(`Startup rescan so far — ${lines.join('; ')}; still scanning…`)
+        } else if (outcome && outcome.error) {
           lines.push(`"${w.name}": could not be opened — permission may have been revoked or the folder moved/deleted. Re-pick just that folder from Settings.`)
+          setWatchStatus(`Startup rescan so far — ${lines.join('; ')}; still scanning…`)
+        } else {
+          token.stalled = true
+          lines.push(`"${w.name}": stalled after 5 minutes on startup — skipped for now. Its books may still appear if the background scan finishes; otherwise tap its Rescan button to retry, or Remove then Add folder to re-grant permission.`)
+          setWatchStatus(`Startup rescan so far — ${lines.join('; ')}; still scanning…`)
         }
       }
       stopWatchdog()
@@ -2652,7 +2764,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.6</p>
+              <p className="progress">ShelfSort v0.7.7</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
