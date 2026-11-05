@@ -537,6 +537,63 @@ export default function App() {
     setBooks(all)
     return all
   }
+  // Progressive import (v0.7.5), BATCHED (v0.7.5 crash fix): a book
+  // appears in the Library DURING its batch, not only at the end —
+  // but NOT one setBooks per book. An unthrottled append per book
+  // re-renders the whole Library (hundreds of cover images, no
+  // virtualization) per book, and each setImportStatus already
+  // re-renders App per book — over a 373-file batch that starves
+  // the WebView event loop and is a plausible contributor to the
+  // "ShelfSort keeps stopping" crash dialog the user saw on v0.7.4.
+  // So appends are buffered and flushed in batches: every 10 books
+  // OR every 500 ms since the last flush, whichever comes first,
+  // plus a final flush at the end of the import (before the final
+  // reload() consistency pass). A small batch (<= 10 books) is
+  // covered by that final flush, so it still appears promptly.
+  // The 500 ms timer is best-effort wall-clock time: it cannot fire
+  // during synchronous parsing work, only while the loop awaits
+  // (file reads, IndexedDB writes) — which is where a large import
+  // actually spends its time. Metadata only — never a file blob,
+  // the same shape reload() returns. Dedupe by id, both inside the
+  // buffer and against existing state: the final reload() replaces
+  // state wholesale anyway, so a flush plus reload can never yield
+  // two entries for one book. Callers must queue ONLY after the
+  // book's commit fully succeeds (never on error, never for a
+  // half-stored audio group — see importFiles/importSafAudio).
+  // Each batcher is created per import call and must be flushed by
+  // that call before it returns — never shared across imports.
+  const APPEND_BATCH_SIZE = 10
+  const APPEND_BATCH_MS = 500
+  function createLibraryAppendBatcher() {
+    let pending = []
+    let timer = null
+    function flush() {
+      if (timer) { clearTimeout(timer); timer = null }
+      if (!pending.length) return
+      const batch = pending
+      pending = []
+      setBooks((prev) => {
+        const ids = new Set(prev.map((b) => b.id))
+        const fresh = batch.filter((b) => b && b.id && !ids.has(b.id))
+        return fresh.length ? [...prev, ...fresh] : prev
+      })
+    }
+    function queue(meta) {
+      if (!meta || !meta.id) return
+      if (pending.some((b) => b.id === meta.id)) return
+      pending.push(meta)
+      if (pending.length >= APPEND_BATCH_SIZE) flush()
+      else if (!timer) timer = setTimeout(flush, APPEND_BATCH_MS)
+    }
+    return { queue, flush }
+  }
+  // Periodic yield on the same batch boundary: lets the WebView
+  // event loop, GC, and UI breathe during a multi-hundred-file
+  // import. Zero-timeout only, and only every 10 books — never
+  // per book, which would slow the import for no benefit.
+  async function yieldToEventLoop() {
+    await new Promise((r) => setTimeout(r, 0))
+  }
   useEffect(() => { reload().catch(() => {}) }, [])
   useEffect(() => { if (folderRef.current) folderRef.current.setAttribute('webkitdirectory', '') }, [])
   useEffect(() => { if (watchFolderRef.current) watchFolderRef.current.setAttribute('webkitdirectory', '') }, [])
@@ -598,6 +655,10 @@ export default function App() {
     setImportErrors([])
     const errors = []
     let imported = 0
+    // Batch throttling (v0.7.5 crash fix): appends, status, and
+    // yields all happen on the same batch boundary — every 10
+    // successfully imported books, plus a final flush at the end.
+    const appendBatch = createLibraryAppendBatcher()
     // One book at a time, committed immediately: meta + file are each
     // written before moving on, so a crash mid-import keeps everything
     // imported so far and the user can simply re-import the rest.
@@ -648,6 +709,10 @@ export default function App() {
               metadata: parsed.metadata,
             },
           })
+          // Audio entries are only collected here (groups import
+          // below), but a long parse pass still needs to breathe:
+          // yield every 10 collected entries, same boundary.
+          if (audioEntries.length % APPEND_BATCH_SIZE === 0) await yieldToEventLoop()
           continue
         }
         const buf = await file.arrayBuffer()
@@ -667,8 +732,16 @@ export default function App() {
         }
         await putBookMeta(meta)
         await putBookFile(id, buf)
+        // Progressive import (v0.7.5), batched: queue this book —
+        // it reaches the Library on the next batch flush (every 10
+        // books / 500 ms / end of import), not via a render per book.
+        appendBatch.queue(meta)
         imported++
-        setImportStatus(`Imported ${imported} book(s) — ${meta.metadata.title}`)
+        if (imported % APPEND_BATCH_SIZE === 0) {
+          appendBatch.flush()
+          setImportStatus(`Imported ${imported} book(s)…`)
+          await yieldToEventLoop()
+        }
       } catch (e) {
         errors.push(`${file.name}: ${e.message}`)
       }
@@ -771,15 +844,30 @@ export default function App() {
         if (isMulti) update.audioParts = audioParts
         if (audioParts[0] && audioParts[0].audioFileUri) update.audioFileUri = audioParts[0].audioFileUri
         await putBookMeta(update)
+        // Progressive import (v0.7.5), batched: queue the finished
+        // GROUP (one book, with its parts/URIs/cover), never the
+        // earlier bare meta above and never once per part file.
+        appendBatch.queue(update)
         imported++
-        setImportStatus(`Imported ${imported} book(s) — ${meta.metadata.title}${isMulti ? ` (${group.entries.length} parts)` : ''}`)
+        if (imported % APPEND_BATCH_SIZE === 0) {
+          appendBatch.flush()
+          setImportStatus(`Imported ${imported} book(s)…`)
+          await yieldToEventLoop()
+        }
       } catch (e) {
         for (const entry of group.entries) errors.push(`${entry.file.name}: ${e.message}`)
       }
     }
+    // Final flush (v0.7.5 crash fix): any books still buffered
+    // (including every book of a small batch) appear NOW, before
+    // the Done message and the reload() consistency pass below.
+    appendBatch.flush()
     setImportErrors(errors)
     setImportStatus(`Done — imported ${imported} book(s) from ${files.length} file(s).${errors.length ? ` ${errors.length} failed (see below).` : ''}`)
     // Metadata only — never reload full file blobs after an import.
+    // Consistency pass only (v0.7.5): books already appended one by
+    // one above are re-read from IndexedDB; reload() replaces state
+    // wholesale, so it cannot duplicate them.
     await reload()
   }
 
@@ -927,6 +1015,10 @@ export default function App() {
     let imported = 0
     let skippedPartial = 0
     const errors = []
+    // Batch throttling, same as importFiles (v0.7.5 crash fix):
+    // appends flush every 10 books, with a yield on that boundary,
+    // plus a final flush before returning.
+    const appendBatch = createLibraryAppendBatcher()
     // Presence is judged ONLY against the library as it stood
     // before this scan: two different book folders may legitimately
     // share a part filename (e.g. part1.m4b in both), and the second
@@ -997,11 +1089,23 @@ export default function App() {
         if (isMulti) meta.audioParts = parts.map((p, i) => ({ partId: `${id}-p${i}`, fileName: p.fileName, audioFileUri: p.audioFileUri, durationSec: p.durationSec }))
         if (parts[0]) meta.audioFileUri = parts[0].audioFileUri
         await putBookMeta(meta)
+        // Progressive import (v0.7.5), batched: SAF audio does NOT
+        // go through importFiles, so this is the one import entry
+        // point that would otherwise bypass appends. Queue here,
+        // only after the URIs + cover + final meta are committed.
+        appendBatch.queue(meta)
         imported++
+        if (imported % APPEND_BATCH_SIZE === 0) {
+          appendBatch.flush()
+          await yieldToEventLoop()
+        }
       } catch (e) {
         errors.push(`${list.map((f) => f.name).join(', ')}: ${e.message}`)
       }
     }
+    // Final flush: any SAF audio books still buffered (including
+    // every book of a small scan) appear before the caller reports.
+    appendBatch.flush()
     return { imported, skippedPartial, errors }
   }
 
@@ -2353,7 +2457,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.4</p>
+              <p className="progress">ShelfSort v0.7.5</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
