@@ -33,7 +33,10 @@ function uid() {
 }
 
 function coverFor(book) {
-  return book.metadata.coverDataUrl || book.metadata.coverUrl || ''
+  // Defensive (v0.7.8): a record with no metadata object must never
+  // throw during render — with no ErrorBoundary in the tree, one
+  // throw unmounts the whole app on every launch.
+  return (book && book.metadata && (book.metadata.coverDataUrl || book.metadata.coverUrl)) || ''
 }
 
 function formatLabel(book) {
@@ -156,7 +159,7 @@ function BookRow({ book, onOpen, onDetail }) {
   return (
     <button className="book-row" {...press}>
       <span className="row-cover">
-        {cover ? <img src={cover} alt="" /> : <span className="cover">No cover</span>}
+        {cover ? <img src={cover} alt="" loading="lazy" decoding="async" onError={(e) => { e.target.style.display = 'none' }} /> : <span className="cover">No cover</span>}
         <span className="row-progress"><span style={{ width: `${Math.round(frac * 100)}%` }} /></span>
       </span>
       <span className="row-text">
@@ -174,7 +177,7 @@ function BookGridCard({ book, onOpen, onDetail }) {
   const press = usePressHandlers(() => onOpen(book), () => onDetail(book))
   return (
     <button className="book-grid" {...press} aria-label={book.metadata.title}>
-      {cover ? <img src={cover} alt="" /> : <div className="cover">No cover</div>}
+      {cover ? <img src={cover} alt="" loading="lazy" decoding="async" onError={(e) => { e.target.style.display = 'none' }} /> : <div className="cover">No cover</div>}
       <span className="book-grid-title">{book.metadata.title}</span>
       <span className="book-grid-author">{book.metadata.author || 'Unknown author'}</span>
     </button>
@@ -230,7 +233,7 @@ function ShelfBook({ book, onOpen, onDetail }) {
     >
       <span className="shelf-cover" style={{ height: `${coverHeight}px` }}>
         {cover ? (
-          <img src={cover} alt="" />
+          <img src={cover} alt="" loading="lazy" decoding="async" onError={(e) => { e.target.style.display = 'none' }} />
         ) : (
           <span className="shelf-nocover" style={{ background: blockColor }}>
             <span className="shelf-nocover-title">{book.metadata.title}</span>
@@ -578,8 +581,13 @@ export default function App() {
   // cycle: loading the library must NEVER pull 300 file blobs into RAM.
   async function reload() {
     const all = await getAllBooksMeta()
-    setBooks(all)
-    return all
+    // Defensive (v0.7.8): normalise here, once, so no render path
+    // ever dereferences book.metadata on a record that lacks it
+    // (a missing metadata object used to throw inside BookRow /
+    // ShelfBook and unmount the whole Library on every launch).
+    const safe = (all || []).map((b) => (b && b.metadata ? b : { ...b, metadata: { title: (b && b.fileName) || '', author: '', coverDataUrl: '', coverUrl: '' } }))
+    setBooks(safe)
+    return safe
   }
   // Progressive import (v0.7.5), BATCHED (v0.7.5 crash fix): a book
   // appears in the Library DURING its batch, not only at the end —
@@ -971,7 +979,11 @@ export default function App() {
     // Consistency pass only (v0.7.5): books already appended one by
     // one above are re-read from IndexedDB; reload() replaces state
     // wholesale, so it cannot duplicate them.
-    await reload()
+    // v0.7.8: if that consistency reload fails (e.g. a huge meta
+    // load right after a huge import), do NOT lose the import's
+    // reporting or the already-appended books — they are committed
+    // in IndexedDB and already in state; just note the reload miss.
+    try { await reload() } catch { setImportStatus((prev) => `${prev} (Library refresh missed — the imported books are saved and will appear on reopen.)`) }
     // v0.7.7: return ACTUAL successes, so SAF callers can report
     // real imported counts instead of "attempted" counts.
     return { imported, skipped }
@@ -1368,7 +1380,9 @@ export default function App() {
     // is overwritten below by the per-folder SAF status, which is
     // the one that carries found/new/already/pruned.
     const nonAudioRes = lazyFiles.length ? await importFiles(lazyFiles) : null
-    if (!lazyFiles.length) await reload()
+    // v0.7.8: same fallback as importFiles — a failed refresh must
+    // not turn a finished SAF scan into a crash or a lost report.
+    if (!lazyFiles.length) { try { await reload() } catch { /* books are committed; they appear on reopen */ } }
     const already = (otherFound.length - toImport.length) + (audioRes.skippedWholeFiles || 0)
     const audioNote = [
       audioRes.imported ? `${audioRes.imported} audiobook(s) linked in place` : '',
@@ -1421,6 +1435,9 @@ export default function App() {
     try {
       const { found, imported, already, pruned } = await importSafFolder(w)
       stopWatchdog()
+      // v0.7.8: a manual scan that completes re-enables startup
+      // auto-scan on later launches.
+      try { localStorage.removeItem('shelfsort-startup-scan-in-progress') } catch { /* ignore */ }
       setWatchStatus(found === 0
         ? `Rescan of "${w.name}" done — 0 files found, which is suspicious for a folder you know is full. It may be unreadable, moved, or its permission revoked; try Remove, then Add folder.`
         : imported
@@ -1481,6 +1498,9 @@ export default function App() {
       }
     }
     stopWatchdog()
+    // v0.7.8: a manual scan that completes clears the startup
+    // crash-skip flag, so the next launch auto-scans again.
+    try { localStorage.removeItem('shelfsort-startup-scan-in-progress') } catch { /* ignore */ }
     // Previously, legacy rows were silently skipped here whenever
     // at least one SAF folder existed — a folder listed in Settings
     // that this button never touched, with no word about it.
@@ -1499,9 +1519,31 @@ export default function App() {
     if (!scanOnStartup || !isNative) return
     const saf = watchedFolders.filter((w) => w.saf && w.id)
     if (!saf.length) return
+    // v0.7.8 crash-skip (launch-loop breaker): the startup scan
+    // used to run on EVERY mount with no memory of the last run,
+    // so a scan that killed the process looped forever — the user
+    // could never reach Settings to turn it off, because the scan
+    // raced the first render on every relaunch. Now the flag below
+    // is set the moment a startup scan starts and cleared only
+    // when its chain completes: if it is still set on the NEXT
+    // launch, the previous launch died mid-scan, so this launch
+    // skips the auto-scan entirely and says so. The user can then
+    // open the app, reach Settings, and tap Rescan manually (a
+    // manual scan that completes clears the flag, re-enabling
+    // auto-scan on later launches).
+    let diedMidScan = false
+    try { diedMidScan = localStorage.getItem('shelfsort-startup-scan-in-progress') === '1' } catch { /* ignore */ }
+    if (diedMidScan) {
+      setWatchStatus('Startup scan skipped — the app closed during the last startup scan, so it will not auto-run again until you tap Rescan watched folders manually.')
+      return
+    }
+    try { localStorage.setItem('shelfsort-startup-scan-in-progress', '1') } catch { /* ignore */ }
     setWatchStatus(`Scanning ${saf.length} watched folder(s) on startup…`)
     const stopWatchdog = startScanWatchdog('your watched folders on startup')
     ;(async () => {
+      // v0.7.8 render gate: let the first Library paint happen
+      // before the scan's heavy work starts, instead of racing it.
+      try { await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))); await new Promise((r) => setTimeout(r, 500)) } catch { /* ignore */ }
       const lines = []
       for (let fi = 0; fi < saf.length; fi++) {
         const w = saf[fi]
@@ -1536,6 +1578,9 @@ export default function App() {
         }
       }
       stopWatchdog()
+      // v0.7.8: chain completed (including stalled folders) — the
+      // next launch may auto-scan again.
+      try { localStorage.removeItem('shelfsort-startup-scan-in-progress') } catch { /* ignore */ }
       setWatchStatus(`Startup rescan done — ${lines.join('; ')}`)
     })()
     // Only the mount run: watchedFolders/scanOnStartup are read
@@ -2518,6 +2563,22 @@ export default function App() {
   const detailPair = detail ? linkedPairFor(detail) : null
   const detailAuto = detail ? autoMatchFor(detail) : null
 
+  // Pagination (v0.7.8 launch-crash fix): the Library used to
+  // render EVERY book's cover <img> at once, eagerly, with no
+  // lazy loading — for a library that just grew to hundreds of
+  // books, the WebView decoded hundreds of full-resolution cover
+  // images on the first paint and was killed (OOM). Covers are
+  // full-size data URLs at import (no downscale exists), so the
+  // fix that also helps the ALREADY-stored library is to render
+  // only the first 60 books and load 60 more per tap — same shelf
+  // look, same order, just not all at once. The count resets
+  // whenever the filter changes, so a new search/sort never shows
+  // a stale tail of the old list.
+  const [visibleCount, setVisibleCount] = useState(60)
+  const filterSig = [search, sortMode, formatTab, statusTab].join('|')
+  useEffect(() => { setVisibleCount(60) }, [filterSig])
+  const visibleBooks = filtered.slice(0, visibleCount)
+
   return (
     <>
       {view !== 'reader' && <header className="topbar">
@@ -2630,14 +2691,19 @@ export default function App() {
             ) : !filtered.length ? (
               <div className="card"><p>No books match this filter.</p></div>
             ) : viewMode === 'shelf' ? (
-              <ShelfRows books={filtered} onOpen={openDirect} onDetail={openBook} />
+              <ShelfRows books={visibleBooks} onOpen={openDirect} onDetail={openBook} />
             ) : viewMode === 'grid' ? (
               <div className="book-grid-wrap">
-                {filtered.map((b) => <BookGridCard key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
+                {visibleBooks.map((b) => <BookGridCard key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
               </div>
             ) : (
               <div className="book-list">
-                {filtered.map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
+                {visibleBooks.map((b) => <BookRow key={b.id} book={b} onOpen={openDirect} onDetail={openBook} />)}
+              </div>
+            )}
+            {filtered.length > visibleCount && (
+              <div className="toolbar" style={{ justifyContent: 'center', marginTop: 12 }}>
+                <button onClick={() => setVisibleCount((c) => c + 60)}>Show more books ({filtered.length - visibleCount} remaining)</button>
               </div>
             )}
           </>
@@ -2764,7 +2830,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.7</p>
+              <p className="progress">ShelfSort v0.7.8</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
