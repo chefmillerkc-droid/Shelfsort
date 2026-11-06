@@ -170,13 +170,26 @@ export function lazySafFile(name, readBytes, dir = '') {
 
 // Chunked base64 -> ArrayBuffer (no giant atob() call that can blow
 // the stack on a multi-megabyte book file).
+// v0.7.9: exact-size allocation. The old code allocated
+// floor(len*3/4) and then .slice()d to the real length, holding a
+// second full copy of every scanned book in memory at once — one
+// of the extra copies behind the watched-folder scan dying around
+// book 19 (base64 string + decoded buffer + slice copy + unzip).
+// The '=' padding tells us the exact decoded length up front, so
+// allocate exactly that and never copy again. The slice fallback
+// only runs if the decoded length ever disagrees with the math,
+// which should not happen for padded base64 from the plugin.
 export function base64ToArrayBuffer(b64) {
   const chunk = 32768
-  const bytes = new Uint8Array(Math.floor((b64.length * 3) / 4))
+  let padding = 0
+  if (b64.endsWith('==')) padding = 2
+  else if (b64.endsWith('=')) padding = 1
+  const bytes = new Uint8Array(Math.floor((b64.length * 3) / 4) - padding)
   let out = 0
   for (let i = 0; i < b64.length; i += chunk) {
     const bin = atob(b64.slice(i, i + chunk))
     for (let j = 0; j < bin.length; j++) bytes[out++] = bin.charCodeAt(j)
   }
-  return bytes.slice(0, out).buffer
+  if (out !== bytes.length) return bytes.slice(0, out).buffer
+  return bytes.buffer
 }

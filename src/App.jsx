@@ -267,7 +267,9 @@ function ShelfRows({ books, onOpen, onDetail }) {
   const rows = []
   for (let i = 0; i < books.length; i += cols) rows.push(books.slice(i, i + cols))
   return (
-    <div className="shelf-wrap">
+    // v0.7.9: --shelf-cols drives the shelf grid in styles.css, so a
+    // partial last row keeps column widths instead of stretching.
+    <div className="shelf-wrap" style={{ '--shelf-cols': cols }}>
       {rows.map((row, ri) => (
         <div className="shelf-row" key={ri}>
           <div className="shelf-books">
@@ -641,8 +643,14 @@ export default function App() {
   }
   // Periodic yield on the same batch boundary: lets the WebView
   // event loop, GC, and UI breathe during a multi-hundred-file
-  // import. Zero-timeout only, and only every 10 books — never
-  // per book, which would slow the import for no benefit.
+  // import. Zero-timeout only. Batch flushes still happen every
+  // 10 books, but importFiles also yields after EVERY file it
+  // reads (v0.7.9): a watched-folder scan file costs ~3-4x its
+  // size transiently through the base64 plugin path, and without
+  // a per-file yield the GC never gets a breath between those
+  // big allocations — which is how a scan dies around book 19.
+  // A zero-timeout yield per file is negligible next to the
+  // parse + store cost of that file, so there is no real slowdown.
   async function yieldToEventLoop() {
     await new Promise((r) => setTimeout(r, 0))
   }
@@ -844,10 +852,20 @@ export default function App() {
         if (imported % APPEND_BATCH_SIZE === 0) {
           appendBatch.flush()
           setImportStatus(`Imported ${imported} book(s)…`)
-          await yieldToEventLoop()
         }
+        // v0.7.9: yield after EVERY file read, not just every 10
+        // imports — see yieldToEventLoop. The per-file buffer
+        // (base64 string + decoded bytes + unzip) is only freed
+        // when the event loop gets a turn, and a scan that never
+        // yields dies around book 19. `buf` goes out of scope
+        // here, so the yield is also the GC's chance to collect it
+        // before the next file is read.
+        await yieldToEventLoop()
       } catch (e) {
         errors.push(`${file.name}: ${e.message}`)
+        // Failed files also yield: a bad file must not leave the
+        // loop running hot straight into the next big read.
+        await yieldToEventLoop()
       }
     }
     // Multi-part audiobooks (see src/lib/multipart.js for the rules):
@@ -2830,7 +2848,7 @@ export default function App() {
                 <input type="checkbox" checked={webtoonDefault} onChange={(e) => setWebtoonDefault(e.target.checked)} />
                 Comics open in webtoon mode by default (continuous vertical strip; can still be toggled per comic in the viewer)
               </label>
-              <p className="progress">ShelfSort v0.7.8</p>
+              <p className="progress">ShelfSort v0.7.9</p>
             </div>
             <div className="card">
               <h2>Library folders</h2>
@@ -2862,6 +2880,16 @@ export default function App() {
                 ))
               )}
               {watchStatus && <p className="progress">{watchStatus}</p>}
+              {/* v0.7.9: scan errors used to show ONLY in the Library
+                  view, so a Settings rescan that stopped at 19
+                  showed no error list at all — the failure was
+                  invisible exactly where the scan was run. Show the
+                  same per-file errors here too. */}
+              {importErrors.length > 0 && (
+                <div className="error">
+                  {importErrors.map((err, i) => <div key={i}>{err}</div>)}
+                </div>
+              )}
             </div>
             <div className="card">
               <h2>Metadata fixes</h2>
